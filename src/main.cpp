@@ -108,18 +108,24 @@ int main(int argc, char *argv[])
 
     std::cout << "start get topk" << std::endl;
 
-    // �文件
+    // 读取文件
     std::chrono::high_resolution_clock::time_point t1 = std::chrono::high_resolution_clock::now();
     UserSpecifiedInput inputs(query_file_dir, doc_file_name);
     std::vector<std::vector<int>> indices;
+    std::vector<std::vector<int>> indices_cpu;
     std::chrono::high_resolution_clock::time_point t2 = std::chrono::high_resolution_clock::now();
     std::cout << "read file cost " << std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() << " ms " << std::endl;
 
     // 计算得分
     doc_query_scoring_gpu_function(inputs.querys, inputs.docs, inputs.doc_lens, indices);
-    
+    std::chrono::high_resolution_clock::time_point t3_1 = std::chrono::high_resolution_clock::now();
+    std::cout << "gpu topk cost " << std::chrono::duration_cast<std::chrono::milliseconds>(t3_1 - t2).count() << " ms " << std::endl;
+
+    doc_query_scoring_cpu_function(inputs.querys, inputs.docs, indices_cpu);
     std::chrono::high_resolution_clock::time_point t3 = std::chrono::high_resolution_clock::now();
-    std::cout << "topk cost " << std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count() << " ms " << std::endl;
+    std::cout << "cpu topk cost " << std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t3_1).count() << " ms " << std::endl;
+
+    compare(indices, indices_cpu);
 
     // get total time
     std::chrono::milliseconds total_time = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t1);

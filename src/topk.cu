@@ -1,5 +1,7 @@
 
 #include "topk.h"
+#include <thread>
+#include <cassert>
 
 typedef uint4 group_t; // uint32_t
 
@@ -138,4 +140,161 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
     cudaFree(d_doc_lens);
     free(h_docs);
 
+}
+
+void do_doc_query_scoring(const std::vector<std::vector<uint16_t>> &docs,
+                          const std::vector<std::vector<unsigned char>> &querys_map,
+                          const std::vector<size_t> &querys_len,
+                          std::vector<std::vector<float>> &scores,
+                          const size_t from, const size_t to)
+{
+
+    for (size_t q = 0; q < querys_map.size(); q++)
+    {
+        for (size_t d = from; d < to; d++)
+        {
+            uint16_t inter = 0;
+            for (const uint16_t id : docs[d])
+            {
+                inter += querys_map[q][id];
+            }
+            scores[q][d] = inter * 1.0 / std::max(querys_len[q], docs[d].size());
+        }
+    }
+}
+
+void do_scoring_topk(const std::vector<std::vector<float>> &scores, const std::vector<int> &s_indices, std::vector<std::vector<int>> &indices, const size_t from, const size_t to)
+{
+    for (size_t q = from; q < to; q++)
+    {
+        std::vector<int> new_indices = s_indices;
+        const std::vector<float> &query_scores = scores[q];
+        std::partial_sort(new_indices.begin(), new_indices.begin() + TOPK, new_indices.end(),
+                          [&query_scores](const int &a, const int &b)
+                          {
+                              if (query_scores[a] != query_scores[b])
+                              {
+                                  return query_scores[a] > query_scores[b];
+                              }
+                              return a < b;
+                          });
+        std::vector<int> s_ans(new_indices.begin(), new_indices.begin() + TOPK);
+        indices[q].swap(s_ans);
+    }
+}
+
+void doc_query_scoring_cpu_function(std::vector<std::vector<uint16_t>> &querys,
+                                    std::vector<std::vector<uint16_t>> &docs,
+                                    std::vector<std::vector<int>> &indices // shape [querys.size(), TOPK]
+)
+{
+
+    size_t n_docs = docs.size();
+    size_t n_querys = querys.size();
+    size_t n_threads = N_THREADS_CPU;
+    if (n_threads > n_docs)
+    {
+        n_threads = n_docs;
+    }
+    size_t n_docs_per_thread = n_docs / n_threads;
+    size_t n_onemore_doc_thread = n_docs - n_docs_per_thread * n_threads;
+    std::vector<size_t> docs_from(n_threads);
+    std::vector<size_t> docs_to(n_threads);
+    for (size_t i = 0; i < n_threads; i++)
+    {
+        if (i < n_onemore_doc_thread)
+        {
+            docs_from[i] = i * (n_docs_per_thread + 1);
+            docs_to[i] = (i + 1) * (n_docs_per_thread + 1);
+        }
+        else
+        {
+            docs_from[i] = i * (n_docs_per_thread) + n_onemore_doc_thread;
+            docs_to[i] = (i + 1) * (n_docs_per_thread) + n_onemore_doc_thread;
+        }
+    }
+
+    std::vector<std::vector<float>> scores(n_querys, std::vector<float>(n_docs, 0.0));
+    std::vector<std::vector<unsigned char>> querys_map(n_querys, std::vector<unsigned char>(MAX_ID, 0));
+    std::vector<size_t> querys_len(n_querys);
+    for (size_t q = 0; q < querys.size(); q++)
+    {
+        for (const uint16_t &id : querys[q])
+        {
+            querys_map[q][id] = 1;
+        }
+        querys_len[q] = querys[q].size();
+    }
+
+    std::vector<std::thread> scoring_threads(n_threads - 1);
+    for (size_t i = 0; i < n_threads - 1; i++)
+    {
+        scoring_threads[i] = std::thread([&, i]()
+                                         { do_doc_query_scoring(docs, querys_map, querys_len, scores, docs_from[i], docs_to[i]); });
+    }
+    do_doc_query_scoring(docs, querys_map, querys_len, scores, docs_from[n_threads - 1], docs_to[n_threads - 1]);
+    for (auto &t : scoring_threads)
+    {
+        t.join();
+    }
+
+    std::cout << "scoring ok!" << std::endl;
+
+    // Top K
+    indices.resize(n_querys);
+    n_threads = N_THREADS_CPU;
+    if (n_threads > n_querys)
+    {
+        n_threads = n_querys;
+    }
+    size_t n_querys_per_thread = n_querys / n_threads;
+    size_t n_onemore_query_thread = n_querys - n_querys_per_thread * n_threads;
+    std::vector<size_t> querys_from(n_threads);
+    std::vector<size_t> querys_to(n_threads);
+    for (size_t i = 0; i < n_threads; i++)
+    {
+        if (i < n_onemore_query_thread)
+        {
+            querys_from[i] = i * (n_querys_per_thread + 1);
+            querys_to[i] = (i + 1) * (n_querys_per_thread + 1);
+        }
+        else
+        {
+            querys_from[i] = i * (n_querys_per_thread) + n_onemore_query_thread;
+            querys_to[i] = (i + 1) * (n_querys_per_thread) + n_onemore_query_thread;
+        }
+    }
+
+    std::vector<int> s_indices(n_docs);
+    for (int i = 0; i < n_docs; ++i)
+    {
+        s_indices[i] = i;
+    }
+    std::vector<std::thread> sorting_threads(n_threads - 1);
+    for (size_t i = 0; i < n_threads - 1; i++)
+    {
+        sorting_threads[i] = std::thread([&, i]()
+                                         { do_scoring_topk(scores, s_indices, indices, querys_from[i], querys_to[i]); });
+    }
+    do_scoring_topk(scores, s_indices, indices, querys_from[n_threads - 1], querys_to[n_threads - 1]);
+    for (auto &t : sorting_threads)
+    {
+        t.join();
+    }
+}
+
+int compare(std::vector<std::vector<int>> &indices_1, std::vector<std::vector<int>> &indices_2) {
+    assert(indices_1.size() == indices_2.size());
+    for (int i = 0; i < indices_1.size(); i++) {
+        assert(indices_1[i].size() == indices_2[i].size());
+        for (int j = 0; j < indices_1[i].size(); j++) {
+            if (indices_1[i][j] != indices_2[i][j]) {
+                printf("r=%d, c=%d, indices(%d) != indices_baseline(%d)\n", i, j, indices_1[i][j], indices_2[i][j]);
+                return 0;
+            }
+        }
+    }
+    printf("compare done!\n");
+
+    return 0;
 }

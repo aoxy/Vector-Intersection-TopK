@@ -8,8 +8,16 @@
 #define MAX_QUERY_SIZE 4096
 #define N_THREADS_IN_ONE_BLOCK 512
 #define TOPK 100
+#define MAX_ID 50000
+#define N_THREADS_CPU 16
 
 void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &query,
     std::vector<std::vector<uint16_t>> &docs,
     std::vector<uint16_t> &lens,
     std::vector<std::vector<int>> &indices);
+
+void doc_query_scoring_cpu_function(std::vector<std::vector<uint16_t>> &query,
+    std::vector<std::vector<uint16_t>> &docs,
+    std::vector<std::vector<int>> &indices);
+
+int compare(std::vector<std::vector<int>> &indices_1, std::vector<std::vector<int>> &indices_2);
