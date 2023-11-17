@@ -143,28 +143,48 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
 }
 
 void do_doc_query_scoring(const std::vector<std::vector<uint16_t>> &docs,
-                          const std::vector<std::vector<unsigned char>> &querys_map,
+                          const std::vector<std::vector<uint64_t>> &querys_map,
                           const std::vector<size_t> &querys_len,
                           std::vector<std::vector<float>> &scores,
                           const size_t from, const size_t to)
 {
-
-    for (size_t q = 0; q < querys_map.size(); q++)
+    #pragma omp parallel for
+    for (size_t d = from; d < to; d++)
     {
-        for (size_t d = from; d < to; d++)
+        #pragma omp parallel for
+        for (size_t q = 0; q < querys_map[0].size(); q++)
         {
-            uint16_t inter = 0;
+            size_t start_q = q * QUERY_GROUP_SIZE;
+            register uint64_t inter = 0;
             for (const uint16_t id : docs[d])
             {
-                inter += querys_map[q][id];
+                inter += querys_map[id][q];
             }
-            scores[q][d] = inter * 1.0 / std::max(querys_len[q], docs[d].size());
+            // uint8_t *inters = reinterpret_cast<uint8_t*>(&inter);
+            // scores[start_q][d] = inters[0] * 1.0 / std::max(querys_len[start_q], docs[d].size());
+            // scores[start_q + 1][d] = inters[1] * 1.0 / std::max(querys_len[start_q + 1], docs[d].size());
+            // scores[start_q + 2][d] = inters[2] * 1.0 / std::max(querys_len[start_q + 2], docs[d].size());
+            // scores[start_q + 3][d] = inters[3] * 1.0 / std::max(querys_len[start_q + 3], docs[d].size());
+            // scores[start_q + 4][d] = inters[4] * 1.0 / std::max(querys_len[start_q + 4], docs[d].size());
+            // scores[start_q + 5][d] = inters[5] * 1.0 / std::max(querys_len[start_q + 5], docs[d].size());
+            // scores[start_q + 6][d] = inters[6] * 1.0 / std::max(querys_len[start_q + 6], docs[d].size());
+            // scores[start_q + 7][d] = inters[7] * 1.0 / std::max(querys_len[start_q + 7], docs[d].size());
+
+            scores[start_q][d] = GET_BYTE_0(inter) * 1.0 / std::max(querys_len[start_q], docs[d].size());
+            scores[start_q + 1][d] = GET_BYTE_1(inter) * 1.0 / std::max(querys_len[start_q + 1], docs[d].size());
+            scores[start_q + 2][d] = GET_BYTE_2(inter) * 1.0 / std::max(querys_len[start_q + 2], docs[d].size());
+            scores[start_q + 3][d] = GET_BYTE_3(inter) * 1.0 / std::max(querys_len[start_q + 3], docs[d].size());
+            scores[start_q + 4][d] = GET_BYTE_4(inter) * 1.0 / std::max(querys_len[start_q + 4], docs[d].size());
+            scores[start_q + 5][d] = GET_BYTE_5(inter) * 1.0 / std::max(querys_len[start_q + 5], docs[d].size());
+            scores[start_q + 6][d] = GET_BYTE_6(inter) * 1.0 / std::max(querys_len[start_q + 6], docs[d].size());
+            scores[start_q + 7][d] = GET_BYTE_7(inter) * 1.0 / std::max(querys_len[start_q + 7], docs[d].size());
         }
     }
 }
 
 void do_scoring_topk(const std::vector<std::vector<float>> &scores, const std::vector<int> &s_indices, std::vector<std::vector<int>> &indices, const size_t from, const size_t to)
 {
+    #pragma omp parallel for
     for (size_t q = from; q < to; q++)
     {
         std::vector<int> new_indices = s_indices;
@@ -188,9 +208,10 @@ void doc_query_scoring_cpu_function(std::vector<std::vector<uint16_t>> &querys,
                                     std::vector<std::vector<int>> &indices // shape [querys.size(), TOPK]
 )
 {
-
+    const uint64_t bit_map[8] = {0x0000000000000001ull, 0x0000000000000100ull, 0x0000000000010000ull, 0x0000000001000000ull, 0x0000000100000000ull, 0x0000010000000000ull, 0x0001000000000000ull, 0x0100000000000000ull};
     size_t n_docs = docs.size();
     size_t n_querys = querys.size();
+    size_t n_querys_group = (n_querys + QUERY_GROUP_SIZE - 1) / QUERY_GROUP_SIZE;
     size_t n_threads = N_THREADS_CPU;
     if (n_threads > n_docs)
     {
@@ -214,16 +235,18 @@ void doc_query_scoring_cpu_function(std::vector<std::vector<uint16_t>> &querys,
         }
     }
 
-    std::vector<std::vector<float>> scores(n_querys, std::vector<float>(n_docs, 0.0));
-    std::vector<std::vector<unsigned char>> querys_map(n_querys, std::vector<unsigned char>(MAX_ID, 0));
-    std::vector<size_t> querys_len(n_querys);
-    for (size_t q = 0; q < querys.size(); q++)
+    std::vector<std::vector<float>> scores(n_querys_group * QUERY_GROUP_SIZE, std::vector<float>(n_docs, 0.0));
+    std::vector<std::vector<uint64_t>> querys_map(MAX_ID, std::vector<uint64_t>(n_querys_group, 0));
+    std::vector<size_t> querys_len(n_querys_group * QUERY_GROUP_SIZE, 1);
+    for (size_t q = 0; q < n_querys_group; q++)
     {
-        for (const uint16_t &id : querys[q])
+        size_t end_q = std::min((q + 1) * QUERY_GROUP_SIZE, n_querys);
+        for (size_t sq = q * QUERY_GROUP_SIZE; sq < end_q; sq++)
         {
-            querys_map[q][id] = 1;
+            std::for_each(querys[sq].begin(), querys[sq].end(), [&](const uint16_t &id)
+                      { querys_map[id][q] |= bit_map[sq & 7]; });
+            querys_len[sq] = querys[sq].size();
         }
-        querys_len[q] = querys[q].size();
     }
 
     std::vector<std::thread> scoring_threads(n_threads - 1);

@@ -10,6 +10,16 @@
 #define TOPK 100
 #define MAX_ID 50000
 #define N_THREADS_CPU 16
+#define QUERY_GROUP_SIZE (sizeof(uint64_t) / sizeof(uint8_t))
+
+#define GET_BYTE_0(WORD) (WORD & 255u)
+#define GET_BYTE_1(WORD) ((WORD >> 8) & 255u)
+#define GET_BYTE_2(WORD) ((WORD >> 16) & 255u)
+#define GET_BYTE_3(WORD) ((WORD >> 24) & 255u)
+#define GET_BYTE_4(WORD) ((WORD >> 32) & 255u)
+#define GET_BYTE_5(WORD) ((WORD >> 40) & 255u)
+#define GET_BYTE_6(WORD) ((WORD >> 48) & 255u)
+#define GET_BYTE_7(WORD) ((WORD >> 56) & 255u)
 
 void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &query,
     std::vector<std::vector<uint16_t>> &docs,
