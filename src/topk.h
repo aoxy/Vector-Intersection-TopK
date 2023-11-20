@@ -10,7 +10,7 @@
 #define TOPK 100
 #define MAX_ID 50000
 #define N_THREADS_CPU 16
-#define QUERY_GROUP_SIZE (sizeof(uint64_t) / sizeof(uint8_t))
+#define QUERY_GROUP_SIZE (sizeof(uint16_t) / sizeof(uint8_t))
 
 #define GET_BYTE_0(WORD) (WORD & 255u)
 #define GET_BYTE_1(WORD) ((WORD >> 8) & 255u)

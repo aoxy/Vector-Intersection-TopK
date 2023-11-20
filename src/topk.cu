@@ -172,12 +172,12 @@ void do_doc_query_scoring(const std::vector<std::vector<uint16_t>> &docs,
 
             scores[start_q][d] = GET_BYTE_0(inter) * 1.0 / std::max(querys_len[start_q], docs[d].size());
             scores[start_q + 1][d] = GET_BYTE_1(inter) * 1.0 / std::max(querys_len[start_q + 1], docs[d].size());
-            scores[start_q + 2][d] = GET_BYTE_2(inter) * 1.0 / std::max(querys_len[start_q + 2], docs[d].size());
-            scores[start_q + 3][d] = GET_BYTE_3(inter) * 1.0 / std::max(querys_len[start_q + 3], docs[d].size());
-            scores[start_q + 4][d] = GET_BYTE_4(inter) * 1.0 / std::max(querys_len[start_q + 4], docs[d].size());
-            scores[start_q + 5][d] = GET_BYTE_5(inter) * 1.0 / std::max(querys_len[start_q + 5], docs[d].size());
-            scores[start_q + 6][d] = GET_BYTE_6(inter) * 1.0 / std::max(querys_len[start_q + 6], docs[d].size());
-            scores[start_q + 7][d] = GET_BYTE_7(inter) * 1.0 / std::max(querys_len[start_q + 7], docs[d].size());
+            // scores[start_q + 2][d] = GET_BYTE_2(inter) * 1.0 / std::max(querys_len[start_q + 2], docs[d].size());
+            // scores[start_q + 3][d] = GET_BYTE_3(inter) * 1.0 / std::max(querys_len[start_q + 3], docs[d].size());
+            // scores[start_q + 4][d] = GET_BYTE_4(inter) * 1.0 / std::max(querys_len[start_q + 4], docs[d].size());
+            // scores[start_q + 5][d] = GET_BYTE_5(inter) * 1.0 / std::max(querys_len[start_q + 5], docs[d].size());
+            // scores[start_q + 6][d] = GET_BYTE_6(inter) * 1.0 / std::max(querys_len[start_q + 6], docs[d].size());
+            // scores[start_q + 7][d] = GET_BYTE_7(inter) * 1.0 / std::max(querys_len[start_q + 7], docs[d].size());
         }
     }
 }
@@ -208,7 +208,8 @@ void doc_query_scoring_cpu_function(std::vector<std::vector<uint16_t>> &querys,
                                     std::vector<std::vector<int>> &indices // shape [querys.size(), TOPK]
 )
 {
-    const uint64_t bit_map[8] = {0x0000000000000001ull, 0x0000000000000100ull, 0x0000000000010000ull, 0x0000000001000000ull, 0x0000000100000000ull, 0x0000010000000000ull, 0x0001000000000000ull, 0x0100000000000000ull};
+    // const uint64_t bit_map[8] = {0x0000000000000001ull, 0x0000000000000100ull, 0x0000000000010000ull, 0x0000000001000000ull, 0x0000000100000000ull, 0x0000010000000000ull, 0x0001000000000000ull, 0x0100000000000000ull};
+    const uint16_t bit_map[2] = {0x0001ull, 0x0100ull};
     size_t n_docs = docs.size();
     size_t n_querys = querys.size();
     size_t n_querys_group = (n_querys + QUERY_GROUP_SIZE - 1) / QUERY_GROUP_SIZE;
@@ -244,7 +245,7 @@ void doc_query_scoring_cpu_function(std::vector<std::vector<uint16_t>> &querys,
         for (size_t sq = q * QUERY_GROUP_SIZE; sq < end_q; sq++)
         {
             std::for_each(querys[sq].begin(), querys[sq].end(), [&](const uint16_t &id)
-                      { querys_map[id][q] |= bit_map[sq & 7]; });
+                      { querys_map[id][q] |= bit_map[sq & 1]; });
             querys_len[sq] = querys[sq].size();
         }
     }
