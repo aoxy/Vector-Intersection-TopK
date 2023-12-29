@@ -3,6 +3,23 @@
 
 typedef uint4 group_t; // uint32_t
 
+bool __device__ binary_search(uint16_t doc_target, const uint16_t* query_on_shm, const int query_len) {
+    register int low = 0;
+    register int high = query_len - 1;
+    register int mid;
+    while (low <= high) {
+        mid = (low + high) >> 1;
+        if (query_on_shm[mid] == doc_target) {
+            return true;
+        } else if (query_on_shm[mid] < doc_target) {
+            low = mid + 1;
+        } else {
+            high = mid - 1;
+        }
+    }
+    return false;
+}
+
 void __global__ docQueryScoringCoalescedMemoryAccessSampleKernel(
         const __restrict__ uint16_t *docs, 
         const int *doc_lens, const size_t n_docs, 
@@ -22,8 +39,9 @@ void __global__ docQueryScoringCoalescedMemoryAccessSampleKernel(
 
     __syncthreads();
 
+    // printf("%ld,%u", n_docs, tnum);// 7853052,7853056
+
     for (auto doc_id = tid; doc_id < n_docs; doc_id += tnum) {
-        register int query_idx = 0;
 
         register float tmp_score = 0.;
 
@@ -41,12 +59,7 @@ void __global__ docQueryScoringCoalescedMemoryAccessSampleKernel(
                     break;
                     // return;
                 }
-                while (query_idx < query_len && query_on_shm[query_idx] < doc_segment[j]) {
-                    ++query_idx;
-                }
-                if (query_idx < query_len) {
-                    tmp_score += (query_on_shm[query_idx] == doc_segment[j]);
-                }
+                tmp_score += binary_search(doc_segment[j], query_on_shm, query_len);
             }
             __syncwarp();
         }
@@ -89,6 +102,12 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
         }
         h_doc_lens_vec[i] = docs[i].size();
     }
+    /*
+    0: [doc_0(0-7), doc_1(0-7), ..., doc_n(0-7)] 8N
+    1: [doc_0(8-15), doc_1(8-15), ..., doc_n(8-15)] 8N
+
+    15: [doc_0(120-127), doc_1(120-127), ..., doc_n(120-127)] 8N
+    */
 
     cudaMemcpy(d_docs, h_docs, sizeof(uint16_t) * MAX_DOC_SIZE * n_docs, cudaMemcpyHostToDevice);
     cudaMemcpy(d_doc_lens, h_doc_lens_vec.data(), sizeof(int) * n_docs, cudaMemcpyHostToDevice);
