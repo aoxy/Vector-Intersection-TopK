@@ -3,22 +3,58 @@
 
 typedef uint4 group_t; // uint32_t
 
-bool __device__ binary_search(uint16_t doc_target, const uint16_t* query_on_shm, const int query_len) {
+__device__ void binary_search(uint16_t doc_target, const uint16_t* query_on_shm, const int query_len, float& score) {
     register int low = 0;
     register int high = query_len - 1;
     register int mid;
     while (low <= high) {
         mid = (low + high) >> 1;
         if (query_on_shm[mid] == doc_target) {
-            return true;
+            score++;
+            return;
         } else if (query_on_shm[mid] < doc_target) {
             low = mid + 1;
         } else {
             high = mid - 1;
         }
     }
-    return false;
 }
+
+#define BINARY_SEARCH_QUERY(doc_target, query_on_shm, query_len, score)                                  \
+    {                                                                                                    \
+        auto left = 0;                                                                                   \
+        auto right = query_len - 1;                                                                      \
+        while (left <= right && doc_target >= query_on_shm[left] && doc_target <= query_on_shm[right]) { \
+            const uint16_t mid = left + (right - left) / 2;                                              \
+            const auto target_query = query_on_shm[mid];                                                 \
+            if (target_query < doc_target) {                                                             \
+                left = mid + 1;                                                                          \
+            } else if (target_query > doc_target) {                                                      \
+                right = mid - 1;                                                                         \
+            } else {                                                                                     \
+                score++;                                                                                 \
+                break;                                                                                   \
+            }                                                                                            \
+        }                                                                                                \
+    }
+
+#define INSERT_SEARCH_QUERY(doc_target, query_on_shm, query_len, score)                                                                    \
+    {                                                                                                                                      \
+        auto left = 0;                                                                                                                     \
+        auto right = query_len - 1;                                                                                                        \
+        while (left <= right && doc_target >= query_on_shm[left] && doc_target <= query_on_shm[right]) {                                   \
+            const uint16_t mid = left + ((right - left) * (doc_target - query_on_shm[left]) / (query_on_shm[right] - query_on_shm[left])); \
+            const auto target_query = query_on_shm[mid];                                                                                   \
+            if (target_query < doc_target) {                                                                                               \
+                left = mid + 1;                                                                                                            \
+            } else if (target_query > doc_target) {                                                                                        \
+                right = mid - 1;                                                                                                           \
+            } else {                                                                                                                       \
+                score++;                                                                                                                   \
+                break;                                                                                                                     \
+            }                                                                                                                              \
+        }                                                                                                                                  \
+    }
 
 void __global__ docQueryScoringCoalescedMemoryAccessSampleKernel(
         const __restrict__ uint16_t *docs, 
@@ -59,7 +95,9 @@ void __global__ docQueryScoringCoalescedMemoryAccessSampleKernel(
                     break;
                     // return;
                 }
-                tmp_score += binary_search(doc_segment[j], query_on_shm, query_len);
+                // binary_search(doc_segment[j], query_on_shm, query_len, tmp_score);
+                BINARY_SEARCH_QUERY(doc_segment[j], query_on_shm, query_len, tmp_score);
+                // INSERT_SEARCH_QUERY(doc_segment[j], query_on_shm, query_len, tmp_score);
             }
             __syncwarp();
         }
