@@ -234,7 +234,7 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
             std::vector<int> s_ans(temp_indices.begin(), temp_indices.begin() + TOPK);
             indices.push_back(s_ans);
         }
-        end_time(t1, "TopK cost: ");
+        end_time(t1, "Partial sort cost: ");
     }
 
     // deallocation
