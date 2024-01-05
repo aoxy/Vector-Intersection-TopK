@@ -1,5 +1,6 @@
 
 #include <thread>
+#include <string>
 #include "topk.h"
 
 typedef uint4 group_t;  // uint32_t
@@ -97,6 +98,15 @@ void PackQuerys(std::vector<std::vector<uint16_t>>& querys,
     CHECK(cudaMemcpy(d_query_batch, h_query_batch.data(), batch_query_bytes * n_batches, cudaMemcpyHostToDevice));
 }
 
+std::chrono::time_point<std::chrono::high_resolution_clock> start_time() {
+    return std::chrono::high_resolution_clock::now();
+}
+
+void end_time(std::chrono::time_point<std::chrono::high_resolution_clock>& t1, std::string message) {
+    auto t2 = std::chrono::high_resolution_clock::now();
+    std::cout << message << std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() << " ms " << std::endl;
+}
+
 void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
                                     std::vector<std::vector<uint16_t>>& docs,
                                     std::vector<uint16_t>& lens,
@@ -176,6 +186,7 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
     float* d_batch_scores = nullptr;
     CHECK(cudaMalloc(&d_batch_scores, sizeof(float) * n_docs * batch_size));
     for (size_t query_idx = 0; query_idx < n_querys; query_idx += batch_size) {
+        auto t1 = start_time();
         uint16_t* d_query_len = reinterpret_cast<uint16_t*>(d_querys_data) + query_idx;
         char* d_query_batch = d_querys_data + total_query_len_bytes + query_idx / batch_size * batch_query_bytes;
         int block = N_THREADS_IN_ONE_BLOCK;
@@ -192,6 +203,9 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
         }
         cudaDeviceSynchronize();
 
+        end_time(t1, "QueryScoring kernel cost: ");
+        t1 = start_time();
+
         CHECK(cudaMemcpy(batch_scores.data(), d_batch_scores, sizeof(float) * n_docs * batch_size, cudaMemcpyDeviceToHost));
 
         cudaError_t err = cudaGetLastError();
@@ -201,6 +215,9 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
             exit(1);
         }
 
+        end_time(t1, "Copy scores cost: ");
+
+        t1 = start_time();
         for (int q = 0; q < batch_size; q++) {
             if (query_idx + q >= n_querys) {
                 break;
@@ -217,6 +234,7 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
             std::vector<int> s_ans(temp_indices.begin(), temp_indices.begin() + TOPK);
             indices.push_back(s_ans);
         }
+        end_time(t1, "TopK cost: ");
     }
 
     // deallocation
