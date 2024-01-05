@@ -1,6 +1,6 @@
 
-#include <thread>
 #include <string>
+#include <thread>
 #include "topk.h"
 
 typedef uint4 group_t;  // uint32_t
@@ -114,7 +114,6 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
 ) {
     auto n_querys = querys.size();
     auto n_docs = docs.size();
-    std::vector<float> scores(n_docs);
     std::vector<int> s_indices(n_docs);
 
     int batch_size;
@@ -142,13 +141,11 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
                                       &d_querys_data);
     }
 
-    float* d_scores = nullptr;
     uint16_t* d_docs = nullptr;
     int* d_doc_lens = nullptr;
 
     // copy to device
     CHECK(cudaMalloc(&d_docs, sizeof(uint16_t) * MAX_DOC_SIZE * n_docs));
-    CHECK(cudaMalloc(&d_scores, sizeof(float) * n_docs));
     CHECK(cudaMalloc(&d_doc_lens, sizeof(int) * n_docs));
 
     uint16_t* h_docs = new uint16_t[MAX_DOC_SIZE * n_docs];
@@ -239,7 +236,6 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
 
     // deallocation
     cudaFree(d_docs);
-    cudaFree(d_scores);
     cudaFree(d_doc_lens);
     cudaFree(d_querys_data);
     cudaFree(d_batch_scores);
