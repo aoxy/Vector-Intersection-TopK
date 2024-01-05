@@ -10,6 +10,8 @@
 #define TOPK 100
 #define QUERY_MAX_VALUE 50000
 #define LONG_SCORES_SCALE 1381200000000
+#define DOCS_PER_THREAD 1
+#define DOC_IN_GROUP (sizeof(group_t) / sizeof(uint16_t))
 
 #define CHECK(call)                                                          \
     {                                                                        \
