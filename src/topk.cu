@@ -54,10 +54,6 @@ void __global__ docQueryScoringCoalescedMemoryAccessSampleKernel(const __restric
             }
         }
         for (auto q = 0; q < BatchSize; q++) {
-            if (q == 19 && doc_id <= 500) {
-                // printf("querys = %ld, q = %d, find = %d\n", static_cast<long>(querys), q, find);
-                printf("doc_id = %d, tmp_scores[q] = %f\n", doc_id, tmp_scores[q]);
-            }
             batch_scores[n_docs * q + doc_id] = tmp_scores[q] / max(s_query_lens[q], doc_lens[doc_id]);
         }
     }
@@ -78,15 +74,14 @@ void PackQuerys(std::vector<std::vector<uint16_t>>& querys,
                 int n_batches,
                 char** d_querys_data) {
     int batch_query_size = batch_query_bytes / sizeof(BatchType);
-    cudaMalloc(d_querys_data, total_query_len_bytes + batch_query_bytes * n_batches);
+    CHECK(cudaMalloc(d_querys_data, total_query_len_bytes + batch_query_bytes * n_batches));
     uint16_t* d_query_len = reinterpret_cast<uint16_t*>(*d_querys_data);
     BatchType* d_query_batch = reinterpret_cast<BatchType*>(*d_querys_data + total_query_len_bytes);
     std::vector<uint16_t> h_query_len(querys.size());
     for (int i = 0; i < querys.size(); i++) {
         h_query_len[i] = querys[i].size();
     }
-    cudaMemcpy(d_query_len, h_query_len.data(), total_query_len_bytes, cudaMemcpyHostToDevice);
-
+    CHECK(cudaMemcpy(d_query_len, h_query_len.data(), total_query_len_bytes, cudaMemcpyHostToDevice));
     std::vector<BatchType> h_query_batch(batch_query_size * n_batches, 0);
     for (size_t idx = 0; idx < querys.size(); idx += batch_size) {
         BatchType* batch_querys_ptr = h_query_batch.data() + idx / batch_size * batch_query_size;
@@ -99,8 +94,7 @@ void PackQuerys(std::vector<std::vector<uint16_t>>& querys,
             }
         }
     }
-
-    cudaMemcpy(d_query_batch, h_query_batch.data(), batch_query_bytes * n_batches, cudaMemcpyHostToDevice);
+    CHECK(cudaMemcpy(d_query_batch, h_query_batch.data(), batch_query_bytes * n_batches, cudaMemcpyHostToDevice));
 }
 
 void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
@@ -114,12 +108,12 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
     std::vector<int> s_indices(n_docs);
 
     int batch_size;
-    if (n_querys <= sizeof(short) * 8) {
-        batch_size = sizeof(short) * 8;
-    } else if (n_querys <= sizeof(int) * 8) {
-        batch_size = sizeof(int) * 8;
+    if (n_querys <= sizeof(unsigned short) * 8) {
+        batch_size = sizeof(unsigned short) * 8;
+    } else if (n_querys <= sizeof(unsigned int) * 8) {
+        batch_size = sizeof(unsigned int) * 8;
     } else {
-        batch_size = sizeof(long) * 8;
+        batch_size = sizeof(unsigned long) * 8;
     }
     int total_query_len_bytes = AlignSize(sizeof(uint16_t) * n_querys);
     int batch_query_bytes = AlignSize(batch_size / 8 * QUERY_MAX_VALUE);
@@ -127,15 +121,15 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
 
     char* d_querys_data = nullptr;
     std::thread* pack_thread;
-    if (batch_size == sizeof(short) * 8) {
-        pack_thread =
-            new std::thread(PackQuerys<int>, std::ref(querys), batch_size, total_query_len_bytes, batch_query_bytes, n_batches, &d_querys_data);
-    } else if (batch_size == sizeof(int) * 8) {
-        pack_thread =
-            new std::thread(PackQuerys<int>, std::ref(querys), batch_size, total_query_len_bytes, batch_query_bytes, n_batches, &d_querys_data);
+    if (batch_size == sizeof(unsigned short) * 8) {
+        pack_thread = new std::thread(PackQuerys<unsigned short>, std::ref(querys), batch_size, total_query_len_bytes, batch_query_bytes, n_batches,
+                                      &d_querys_data);
+    } else if (batch_size == sizeof(unsigned int) * 8) {
+        pack_thread = new std::thread(PackQuerys<unsigned int>, std::ref(querys), batch_size, total_query_len_bytes, batch_query_bytes, n_batches,
+                                      &d_querys_data);
     } else {
-        pack_thread =
-            new std::thread(PackQuerys<int>, std::ref(querys), batch_size, total_query_len_bytes, batch_query_bytes, n_batches, &d_querys_data);
+        pack_thread = new std::thread(PackQuerys<unsigned long>, std::ref(querys), batch_size, total_query_len_bytes, batch_query_bytes, n_batches,
+                                      &d_querys_data);
     }
 
     float* d_scores = nullptr;
@@ -143,9 +137,9 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
     int* d_doc_lens = nullptr;
 
     // copy to device
-    cudaMalloc(&d_docs, sizeof(uint16_t) * MAX_DOC_SIZE * n_docs);
-    cudaMalloc(&d_scores, sizeof(float) * n_docs);
-    cudaMalloc(&d_doc_lens, sizeof(int) * n_docs);
+    CHECK(cudaMalloc(&d_docs, sizeof(uint16_t) * MAX_DOC_SIZE * n_docs));
+    CHECK(cudaMalloc(&d_scores, sizeof(float) * n_docs));
+    CHECK(cudaMalloc(&d_doc_lens, sizeof(int) * n_docs));
 
     uint16_t* h_docs = new uint16_t[MAX_DOC_SIZE * n_docs];
     memset(h_docs, 0, sizeof(uint16_t) * MAX_DOC_SIZE * n_docs);
@@ -164,8 +158,8 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
         h_doc_lens_vec[i] = docs[i].size();
     }
 
-    cudaMemcpy(d_docs, h_docs, sizeof(uint16_t) * MAX_DOC_SIZE * n_docs, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_doc_lens, h_doc_lens_vec.data(), sizeof(int) * n_docs, cudaMemcpyHostToDevice);
+    CHECK(cudaMemcpy(d_docs, h_docs, sizeof(uint16_t) * MAX_DOC_SIZE * n_docs, cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(d_doc_lens, h_doc_lens_vec.data(), sizeof(int) * n_docs, cudaMemcpyHostToDevice));
 
     cudaDeviceProp device_props;
     cudaGetDeviceProperties(&device_props, 0);
@@ -180,38 +174,38 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
     }
     std::vector<float> batch_scores(n_docs * batch_size);
     float* d_batch_scores = nullptr;
-    cudaMalloc(&d_batch_scores, sizeof(float) * n_docs * batch_size);
+    CHECK(cudaMalloc(&d_batch_scores, sizeof(float) * n_docs * batch_size));
     for (size_t query_idx = 0; query_idx < n_querys; query_idx += batch_size) {
         uint16_t* d_query_len = reinterpret_cast<uint16_t*>(d_querys_data) + query_idx;
         char* d_query_batch = d_querys_data + total_query_len_bytes + query_idx / batch_size * batch_query_bytes;
         int block = N_THREADS_IN_ONE_BLOCK;
         int grid = (n_docs + block - 1) / block;
-        if (batch_size == sizeof(short) * 8) {
-            docQueryScoringCoalescedMemoryAccessSampleKernel<short, sizeof(short) * 8>
-                <<<grid, block>>>(d_docs, d_doc_lens, n_docs, d_query_len, reinterpret_cast<short*>(d_query_batch), d_batch_scores);
-        } else if (batch_size == sizeof(int) * 8) {
-            docQueryScoringCoalescedMemoryAccessSampleKernel<int, sizeof(int) * 8>
-                <<<grid, block>>>(d_docs, d_doc_lens, n_docs, d_query_len, reinterpret_cast<int*>(d_query_batch), d_batch_scores);
+        if (batch_size == sizeof(unsigned short) * 8) {
+            docQueryScoringCoalescedMemoryAccessSampleKernel<unsigned short, sizeof(unsigned short) * 8>
+                <<<grid, block>>>(d_docs, d_doc_lens, n_docs, d_query_len, reinterpret_cast<unsigned short*>(d_query_batch), d_batch_scores);
+        } else if (batch_size == sizeof(unsigned int) * 8) {
+            docQueryScoringCoalescedMemoryAccessSampleKernel<unsigned int, sizeof(unsigned int) * 8>
+                <<<grid, block>>>(d_docs, d_doc_lens, n_docs, d_query_len, reinterpret_cast<unsigned int*>(d_query_batch), d_batch_scores);
         } else {
-            docQueryScoringCoalescedMemoryAccessSampleKernel<long, sizeof(long) * 8>
-                <<<grid, block>>>(d_docs, d_doc_lens, n_docs, d_query_len, reinterpret_cast<long*>(d_query_batch), d_batch_scores);
+            docQueryScoringCoalescedMemoryAccessSampleKernel<unsigned long, sizeof(unsigned long) * 8>
+                <<<grid, block>>>(d_docs, d_doc_lens, n_docs, d_query_len, reinterpret_cast<unsigned long*>(d_query_batch), d_batch_scores);
         }
         cudaDeviceSynchronize();
 
-        cudaMemcpy(batch_scores.data(), d_batch_scores, sizeof(long) * n_docs * batch_size, cudaMemcpyDeviceToHost);
+        CHECK(cudaMemcpy(batch_scores.data(), d_batch_scores, sizeof(float) * n_docs * batch_size, cudaMemcpyDeviceToHost));
+
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            printf("ERROR: %s:%d,", __FILE__, __LINE__);
+            printf("CUDA Error[%d]: %s\n", err, cudaGetErrorString(err));
+            exit(1);
+        }
 
         for (int q = 0; q < batch_size; q++) {
             if (query_idx + q >= n_querys) {
                 break;
             }
             float* scores = batch_scores.data() + q * n_docs;
-
-            if (query_idx + q == 19) {
-                for (size_t i = 0; i < 500; i++) {
-                    printf("doc_id = %d, scores[q] = %f\n", i, scores[q]);
-                }
-                std::cout << std::endl;
-            }
 
             std::vector<int> temp_indices(s_indices);
             std::partial_sort(temp_indices.begin(), temp_indices.begin() + TOPK, temp_indices.end(), [&scores](const int& a, const int& b) {
