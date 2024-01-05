@@ -1,6 +1,6 @@
 
-#include <thread>
 #include <string>
+#include <thread>
 #include "topk.h"
 
 typedef uint4 group_t;  // uint32_t
@@ -11,7 +11,7 @@ void __global__ docQueryScoringCoalescedMemoryAccessSampleKernel(const __restric
                                                                  const size_t n_docs,
                                                                  uint16_t* query_len,
                                                                  const BatchType* d_query_batch,
-                                                                 float* batch_scores) {
+                                                                 long* batch_scores) {
     // each thread process one batch doc-querys pair scoring task
     register auto tid = blockIdx.x * blockDim.x + threadIdx.x, tnum = gridDim.x * blockDim.x;
 
@@ -28,7 +28,7 @@ void __global__ docQueryScoringCoalescedMemoryAccessSampleKernel(const __restric
     __syncthreads();
 
     for (auto doc_id = tid; doc_id < n_docs; doc_id += tnum) {
-        float tmp_scores[BatchSize] = {0.};
+        unsigned char tmp_scores[BatchSize] = {0};
         register bool no_more_load = false;
 
         for (auto i = 0; i < MAX_DOC_SIZE / (sizeof(group_t) / sizeof(uint16_t)); i++) {
@@ -55,7 +55,7 @@ void __global__ docQueryScoringCoalescedMemoryAccessSampleKernel(const __restric
             }
         }
         for (auto q = 0; q < BatchSize; q++) {
-            batch_scores[n_docs * q + doc_id] = tmp_scores[q] / max(s_query_lens[q], doc_lens[doc_id]);
+            batch_scores[n_docs * q + doc_id] = LONG_SCORES_SCALE * tmp_scores[q] / max(s_query_lens[q], doc_lens[doc_id]) - doc_id;
         }
     }
 }
@@ -114,7 +114,6 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
 ) {
     auto n_querys = querys.size();
     auto n_docs = docs.size();
-    std::vector<float> scores(n_docs);
     std::vector<int> s_indices(n_docs);
 
     int batch_size;
@@ -142,13 +141,11 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
                                       &d_querys_data);
     }
 
-    float* d_scores = nullptr;
     uint16_t* d_docs = nullptr;
     int* d_doc_lens = nullptr;
 
     // copy to device
     CHECK(cudaMalloc(&d_docs, sizeof(uint16_t) * MAX_DOC_SIZE * n_docs));
-    CHECK(cudaMalloc(&d_scores, sizeof(float) * n_docs));
     CHECK(cudaMalloc(&d_doc_lens, sizeof(int) * n_docs));
 
     uint16_t* h_docs = new uint16_t[MAX_DOC_SIZE * n_docs];
@@ -182,9 +179,9 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
     for (int i = 0; i < n_docs; ++i) {
         s_indices[i] = i;
     }
-    std::vector<float> batch_scores(n_docs * batch_size);
-    float* d_batch_scores = nullptr;
-    CHECK(cudaMalloc(&d_batch_scores, sizeof(float) * n_docs * batch_size));
+    std::vector<long> batch_scores(n_docs * batch_size);
+    long* d_batch_scores = nullptr;
+    CHECK(cudaMalloc(&d_batch_scores, sizeof(long) * n_docs * batch_size));
     for (size_t query_idx = 0; query_idx < n_querys; query_idx += batch_size) {
         auto t1 = start_time();
         uint16_t* d_query_len = reinterpret_cast<uint16_t*>(d_querys_data) + query_idx;
@@ -206,7 +203,7 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
         end_time(t1, "QueryScoring kernel cost: ");
         t1 = start_time();
 
-        CHECK(cudaMemcpy(batch_scores.data(), d_batch_scores, sizeof(float) * n_docs * batch_size, cudaMemcpyDeviceToHost));
+        CHECK(cudaMemcpy(batch_scores.data(), d_batch_scores, sizeof(long) * n_docs * batch_size, cudaMemcpyDeviceToHost));
 
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
@@ -222,15 +219,11 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
             if (query_idx + q >= n_querys) {
                 break;
             }
-            float* scores = batch_scores.data() + q * n_docs;
+            long* scores = batch_scores.data() + q * n_docs;
 
             std::vector<int> temp_indices(s_indices);
-            std::partial_sort(temp_indices.begin(), temp_indices.begin() + TOPK, temp_indices.end(), [&scores](const int& a, const int& b) {
-                if (scores[a] != scores[b]) {
-                    return scores[a] > scores[b];
-                }
-                return a < b;
-            });
+            std::partial_sort(temp_indices.begin(), temp_indices.begin() + TOPK, temp_indices.end(),
+                              [&scores](const int& a, const int& b) { return scores[a] > scores[b]; });
             std::vector<int> s_ans(temp_indices.begin(), temp_indices.begin() + TOPK);
             indices.push_back(s_ans);
         }
@@ -239,7 +232,6 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
 
     // deallocation
     cudaFree(d_docs);
-    cudaFree(d_scores);
     cudaFree(d_doc_lens);
     cudaFree(d_querys_data);
     cudaFree(d_batch_scores);
