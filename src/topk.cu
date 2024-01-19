@@ -28,7 +28,7 @@ void __global__ docQueryScoringCoalescedMemoryAccessSampleKernel(const __restric
     __syncthreads();
 
     for (auto doc_id = tid; doc_id < n_docs; doc_id += tnum) {
-        float tmp_scores[BatchSize] = {0.};
+        register float tmp_scores[BatchSize] = {0.};
         register bool no_more_load = false;
 
         for (auto i = 0; i < MAX_DOC_SIZE / (sizeof(group_t) / sizeof(uint16_t)); i++) {
@@ -117,7 +117,9 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
     std::vector<int> s_indices(n_docs);
 
     int batch_size;
-    if (n_querys <= sizeof(unsigned short) * 8) {
+    if (n_querys <= sizeof(unsigned char) * 8) {
+        batch_size = sizeof(unsigned char) * 8;
+    } else if (n_querys <= sizeof(unsigned short) * 8) {
         batch_size = sizeof(unsigned short) * 8;
     } else if (n_querys <= sizeof(unsigned int) * 8) {
         batch_size = sizeof(unsigned int) * 8;
@@ -130,7 +132,10 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
 
     char* d_querys_data = nullptr;
     std::thread* pack_thread;
-    if (batch_size == sizeof(unsigned short) * 8) {
+    if (batch_size == sizeof(unsigned char) * 8) {
+        pack_thread = new std::thread(PackQuerys<unsigned char>, std::ref(querys), batch_size, total_query_len_bytes, batch_query_bytes, n_batches,
+                                      &d_querys_data);
+    } else if (batch_size == sizeof(unsigned short) * 8) {
         pack_thread = new std::thread(PackQuerys<unsigned short>, std::ref(querys), batch_size, total_query_len_bytes, batch_query_bytes, n_batches,
                                       &d_querys_data);
     } else if (batch_size == sizeof(unsigned int) * 8) {
@@ -188,7 +193,10 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
         char* d_query_batch = d_querys_data + total_query_len_bytes + query_idx / batch_size * batch_query_bytes;
         int block = N_THREADS_IN_ONE_BLOCK;
         int grid = (n_docs + block - 1) / block;
-        if (batch_size == sizeof(unsigned short) * 8) {
+        if (batch_size == sizeof(unsigned char) * 8) {
+            docQueryScoringCoalescedMemoryAccessSampleKernel<unsigned char, sizeof(unsigned char) * 8>
+                <<<grid, block>>>(d_docs, d_doc_lens, n_docs, d_query_len, reinterpret_cast<unsigned char*>(d_query_batch), d_batch_scores);
+        } else if (batch_size == sizeof(unsigned short) * 8) {
             docQueryScoringCoalescedMemoryAccessSampleKernel<unsigned short, sizeof(unsigned short) * 8>
                 <<<grid, block>>>(d_docs, d_doc_lens, n_docs, d_query_len, reinterpret_cast<unsigned short*>(d_query_batch), d_batch_scores);
         } else if (batch_size == sizeof(unsigned int) * 8) {
