@@ -1,5 +1,6 @@
 
 #include "topk.h"
+#include <chrono>
 
 typedef uint4 group_t; // uint32_t
 
@@ -52,6 +53,15 @@ void __global__ docQueryScoringCoalescedMemoryAccessSampleKernel(
         }
         scores[doc_id] = tmp_score / max(query_len, doc_lens[doc_id]); // tid
     }
+}
+
+std::chrono::time_point<std::chrono::high_resolution_clock> start_time() {
+    return std::chrono::high_resolution_clock::now();
+}
+
+void end_time(std::chrono::time_point<std::chrono::high_resolution_clock>& t1, std::string message) {
+    auto t2 = std::chrono::high_resolution_clock::now();
+    std::cout << message << std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() << " ms " << std::endl;
 }
 
 void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
@@ -109,15 +119,20 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
         cudaMemcpy(d_query, query.data(), sizeof(uint16_t) * query_len, cudaMemcpyHostToDevice);
 
         // launch kernel
+        auto t1 = start_time();
         int block = N_THREADS_IN_ONE_BLOCK;
         int grid = (n_docs + block - 1) / block;
         docQueryScoringCoalescedMemoryAccessSampleKernel<<<grid, block>>>(d_docs,
             d_doc_lens, n_docs, d_query, query_len, d_scores);
         cudaDeviceSynchronize();
+        end_time(t1, "QueryScoring kernel cost: ");
 
+        t1 = start_time();
         cudaMemcpy(scores.data(), d_scores, sizeof(float) * n_docs, cudaMemcpyDeviceToHost);
+        end_time(t1, "Copy scores cost: ");
 
         // sort scores
+        t1 = start_time();
         std::partial_sort(s_indices.begin(), s_indices.begin() + TOPK, s_indices.end(),
                         [&scores](const int& a, const int& b) {
                             if (scores[a] != scores[b]) {
@@ -127,7 +142,7 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
                     });
         std::vector<int> s_ans(s_indices.begin(), s_indices.begin() + TOPK);
         indices.push_back(s_ans);
-
+        end_time(t1, "Partial sort cost: ");
         cudaFree(d_query);
     }
 
