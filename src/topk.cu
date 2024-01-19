@@ -28,7 +28,7 @@ void __global__ docQueryScoringCoalescedMemoryAccessSampleKernel(const __restric
     __syncthreads();
 
     for (auto doc_id = tid; doc_id < n_docs; doc_id += tnum) {
-        register float tmp_scores[BatchSize] = {0.};
+        register unsigned char tmp_scores[BatchSize] = {0};
         register bool no_more_load = false;
 
         for (auto i = 0; i < MAX_DOC_SIZE / (sizeof(group_t) / sizeof(uint16_t)); i++) {
@@ -55,7 +55,7 @@ void __global__ docQueryScoringCoalescedMemoryAccessSampleKernel(const __restric
             }
         }
         for (auto q = 0; q < BatchSize; q++) {
-            batch_scores[n_docs * q + doc_id] = tmp_scores[q] / max(s_query_lens[q], doc_lens[doc_id]);
+            batch_scores[n_docs * q + doc_id] = tmp_scores[q] * 1.0f / max(s_query_lens[q], doc_lens[doc_id]);
         }
     }
 }
