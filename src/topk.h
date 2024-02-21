@@ -11,6 +11,8 @@
 #define QUERY_MAX_VALUE 50000
 #define LONG_SCORES_SCALE 1381200000000
 #define QUERY_MASK_SIZE 1568
+#define MAX_BATCH_SIZE 4
+#define WINDOW_SIZE 10
 
 #define CHECK(call)                                                          \
     {                                                                        \

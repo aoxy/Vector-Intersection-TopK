@@ -10,59 +10,136 @@ typedef uint4 group_t;  // uint32_t
 template <typename BatchType, int BatchSize>
 void __global__ docQueryScoringInWindowKernel(const __restrict__ uint16_t* docs,
                                               const int* doc_lens,
+                                              const size_t win_docs,
                                               const size_t n_docs,
                                               const size_t doc_start,
                                               const size_t doc_end,
                                               uint16_t* query_len,
-                                              const uint32_t* d_query_batch,
+                                              uint32_t* d_query_mask,
+                                              const uint16_t max_query_token,
                                               short* batch_scores) {
-    // each thread process one batch doc-querys pair scoring task
-    register auto tid = blockIdx.x * blockDim.x + threadIdx.x, tnum = gridDim.x * blockDim.x;
-
-    if (tid >= n_docs) {
-        return;
-    }
+    register auto tid = blockIdx.x * blockDim.x + threadIdx.x;
+    register auto doc_id = doc_start + tid;
 
     __shared__ uint32_t query_mask[BatchSize * QUERY_MASK_SIZE];
+
 #pragma unroll
-    for (auto q = threadIdx.x; q < BatchSize * QUERY_MASK_SIZE; q += blockDim.x) {
-        query_mask[q] = __ldg(d_query_batch + q);
+    for (auto q = threadIdx.x; q < BatchSize * QUERY_MASK_SIZE; q += N_THREADS_IN_ONE_BLOCK) {
+        query_mask[q] = __ldg(d_query_mask + q);
     }
 
     __syncthreads();
 
-    for (auto doc_id = tid; doc_id < n_docs; doc_id += tnum) {
-        unsigned char tmp_scores[BatchSize] = {0};
-        register bool no_more_load = false;
+    if (tid >= win_docs) {
+        return;
+    }
+
+    unsigned char tmp_scores[BatchSize] = {0};
+    register bool no_more_load = false;
 #pragma unroll
-        for (auto i = 0; i < MAX_DOC_SIZE / (sizeof(group_t) / sizeof(uint16_t)); i++) {
-            if (no_more_load) {
+    for (auto i = 0; i < MAX_DOC_SIZE / (sizeof(group_t) / sizeof(uint16_t)); i++) {
+        if (no_more_load) {
+            break;
+        }
+        register group_t loaded = ((group_t*)docs)[i * n_docs + doc_id];
+        register uint16_t* doc_segment = (uint16_t*)(&loaded);
+#pragma unroll
+        for (auto j = 0; j < sizeof(group_t) / sizeof(uint16_t); j++) {
+            if (doc_segment[j] == 0 || doc_segment[j] > max_query_token) {
+                no_more_load = true;
                 break;
             }
-            register group_t loaded = ((group_t*)docs)[i * n_docs + doc_id];
-            register uint16_t* doc_segment = (uint16_t*)(&loaded);
+            uint16_t tindex = doc_segment[j] >> 5;
+            uint16_t tpos = doc_segment[j] & 31;
+
+            BatchType mask = reinterpret_cast<BatchType*>(query_mask)[tindex];
+            uint32_t* mask_ptr = reinterpret_cast<uint32_t*>(&mask);
+
 #pragma unroll
-            for (auto j = 0; j < sizeof(group_t) / sizeof(uint16_t); j++) {
-                if (doc_segment[j] == 0) {
-                    no_more_load = true;
-                    break;
-                }
-                uint16_t tindex = doc_segment[j] >> 5;
-                uint16_t tpos = doc_segment[j] & 31;
-                BatchType mask = reinterpret_cast<BatchType*>(query_mask)[tindex];
-                uint32_t* mask_ptr = reinterpret_cast<uint32_t*>(&mask);
-#pragma unroll
-                for (auto q = 0; q < BatchSize; q++) {
-                    bool find = (mask_ptr[q] >> tpos) & static_cast<uint32_t>(1);
-                    if (find) {
-                        tmp_scores[q]++;
-                    }
+            for (auto q = 0; q < BatchSize; q++) {
+                bool find = (mask_ptr[q] >> tpos) & static_cast<uint32_t>(1);
+                if (find) {
+                    tmp_scores[q]++;
                 }
             }
         }
-        for (auto q = 0; q < BatchSize; q++) {
-            batch_scores[n_docs * q + doc_id] = static_cast<short>(16384u * tmp_scores[q] / max(query_len[q], doc_lens[doc_id]));
+    }
+    for (auto q = 0; q < BatchSize; q++) {
+        batch_scores[win_docs * q + tid] = static_cast<short>(16384u * tmp_scores[q] / max(query_len[q], doc_lens[doc_id]));
+    }
+}
+
+template <typename BatchType, int BatchSize>
+void __global__ docQueryScoringThreshKernel(const __restrict__ uint16_t* docs,
+                                            const int* doc_lens,
+                                            const int doc_offset1,
+                                            const int doc_num1,
+                                            const int doc_offset2,
+                                            const int doc_num2,
+                                            const size_t n_docs,
+                                            uint16_t* query_len,
+                                            const uint32_t* d_query_mask,
+                                            const int max_query_len,
+                                            const uint16_t max_query_token,
+                                            const float thresh,
+                                            short* batch_scores) {
+    register auto tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int doc_num = doc_num1 + doc_num2;
+    register auto doc_id = tid < doc_num1 ? (doc_offset1 + tid) : (doc_offset2 + tid - doc_num1);
+
+    __shared__ uint32_t query_mask[BatchSize * QUERY_MASK_SIZE];
+#pragma unroll
+    for (auto q = threadIdx.x; q < BatchSize * QUERY_MASK_SIZE; q += N_THREADS_IN_ONE_BLOCK) {
+        query_mask[q] = __ldg(d_query_mask + q);
+    }
+
+    __syncthreads();
+
+    if (tid >= doc_num) {
+        return;
+    }
+
+    int doc_len = doc_lens[doc_id];
+    uint32_t tmp_score_thresh = static_cast<uint32_t>(thresh * max(doc_len, max_query_len));
+    unsigned char tmp_scores[BatchSize] = {0};
+    register bool no_more_load = false;
+#pragma unroll
+    for (auto i = 0; i < MAX_DOC_SIZE / (sizeof(group_t) / sizeof(uint16_t)); i++) {
+        if (no_more_load) {
+            break;
         }
+        register group_t loaded = ((group_t*)docs)[i * n_docs + doc_id];
+        register uint16_t* doc_segment = (uint16_t*)(&loaded);
+#pragma unroll
+        for (auto j = 0; j < sizeof(group_t) / sizeof(uint16_t); j++) {
+            if (doc_segment[j] == 0 || doc_segment[j] > max_query_token) {
+                no_more_load = true;
+                break;
+            }
+            uint16_t tindex = doc_segment[j] >> 5;
+            uint16_t tpos = doc_segment[j] & 31;
+            BatchType mask = reinterpret_cast<BatchType*>(query_mask)[tindex];
+            uint32_t* mask_ptr = reinterpret_cast<uint32_t*>(&mask);
+#pragma unroll
+            for (auto q = 0; q < BatchSize; q++) {
+                bool find = (mask_ptr[q] >> tpos) & static_cast<uint32_t>(1);
+                if (find) {
+                    tmp_scores[q]++;
+                }
+            }
+        }
+        unsigned char max_tmp_score = tmp_scores[0];
+
+#pragma unroll
+        for (auto q = 1; q < BatchSize; q++) {
+            max_tmp_score = max(max_tmp_score, tmp_scores[q]);
+        }
+        if (max_tmp_score + (doc_len - (i + 1) * 8) < tmp_score_thresh) {
+            break;
+        }
+    }
+    for (auto q = 0; q < BatchSize; q++) {
+        batch_scores[doc_num * q + tid] = static_cast<short>(16384u * tmp_scores[q] / max(query_len[q], doc_len));
     }
 }
 
@@ -73,38 +150,25 @@ __forceinline__ size_t AlignSize(size_t size, size_t align = 128) {
     return (size + align - 1) / align * align;
 }
 
-template <typename BatchType>
-void PackQuerys(const std::vector<std::vector<uint16_t>>& querys,
-                const std::vector<int>& query_idx,
-                int batch_size,
-                int total_query_len_bytes,
-                int batch_query_bytes,
-                int n_batches,
-                char** d_querys_data) {
-    int batch_query_size = batch_query_bytes / sizeof(BatchType);
-    CHECK(cudaMalloc(d_querys_data, total_query_len_bytes + batch_query_bytes * n_batches));
-    uint16_t* d_query_len = reinterpret_cast<uint16_t*>(*d_querys_data);
-    BatchType* d_query_batch = reinterpret_cast<BatchType*>(*d_querys_data + total_query_len_bytes);
-    std::vector<uint16_t> h_query_len(querys.size());
-    for (int i = 0; i < querys.size(); i++) {
-        h_query_len[i] = querys[query_idx[i]].size();
-    }
-    CHECK(cudaMemcpy(d_query_len, h_query_len.data(), total_query_len_bytes, cudaMemcpyHostToDevice));
-    std::vector<BatchType> h_query_batch(batch_query_size * n_batches, 0);
-    for (size_t idx = 0; idx < querys.size(); idx += batch_size) {
-        BatchType* batch_querys_ptr = h_query_batch.data() + idx / batch_size * batch_query_size;
-        if (idx + batch_size > querys.size()) {
-            batch_size = querys.size() - idx;
+__forceinline__ void PackQuerys(const std::vector<std::vector<uint16_t>>& querys,
+                                const std::vector<int>& query_idx,
+                                int batch_size,
+                                char* h_querys_data,
+                                char* d_querys_data) {
+    int batch_query_bytes = AlignSize(MAX_BATCH_SIZE * sizeof(uint16_t) + MAX_BATCH_SIZE * QUERY_MAX_VALUE / sizeof(uint32_t));
+    memset(h_querys_data, 0, batch_query_bytes);
+    uint16_t* h_query_len = reinterpret_cast<uint16_t*>(h_querys_data);
+    uint32_t* h_query_mask = reinterpret_cast<uint32_t*>(h_querys_data + MAX_BATCH_SIZE * sizeof(uint16_t));
+    for (size_t j = 0; j < batch_size; j++) {
+        const std::vector<uint16_t>& query = querys[query_idx[j]];
+        for (auto& q : query) {
+            uint16_t index = q >> 5;
+            uint16_t postion = q & 31;
+            h_query_mask[batch_size * index + j] |= static_cast<uint32_t>(1) << postion;
         }
-        for (size_t j = 0; j < batch_size; j++) {
-            for (auto& q : querys[query_idx[j + idx]]) {
-                uint16_t index = q >> 5;
-                uint16_t postion = q & 31;
-                batch_querys_ptr[batch_size * index + j] |= static_cast<BatchType>(1) << postion;
-            }
-        }
+        h_query_len[j] = query.size();
     }
-    CHECK(cudaMemcpy(d_query_batch, h_query_batch.data(), batch_query_bytes * n_batches, cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(d_querys_data, h_querys_data, batch_query_bytes, cudaMemcpyHostToDevice));
 }
 
 std::chrono::time_point<std::chrono::high_resolution_clock> start_time() {
@@ -116,6 +180,12 @@ void end_time(std::chrono::time_point<std::chrono::high_resolution_clock>& t1, s
     std::cout << message << std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() << " ms " << std::endl;
 }
 
+void end_time(std::chrono::time_point<std::chrono::high_resolution_clock>& t1, std::string message, int batch_idx) {
+    auto t2 = std::chrono::high_resolution_clock::now();
+    std::cout << "Batch[" << batch_idx << "] " << message << std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() << " ms "
+              << std::endl;
+}
+
 void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
                                     std::vector<std::vector<uint16_t>>& docs,
                                     std::vector<uint16_t>& lens,
@@ -125,10 +195,10 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
     auto n_docs = docs.size();
     std::vector<int> s_indices(n_docs);
 
-    int batch_size = 3;
+    int batch_size;
+    const int init_batch_size = 4;
     int total_query_len_bytes = AlignSize(sizeof(uint16_t) * n_querys);
-    int batch_query_bytes = AlignSize(batch_size * QUERY_MAX_VALUE / sizeof(uint32_t));
-    int n_batches = (n_querys + batch_size - 1) / batch_size;
+    int max_batch_query_bytes = AlignSize(MAX_BATCH_SIZE * sizeof(uint16_t) + MAX_BATCH_SIZE * QUERY_MAX_VALUE / sizeof(uint32_t));
 
     std::vector<int> query_idx(n_querys);
     std::iota(query_idx.begin(), query_idx.end(), 0);
@@ -139,15 +209,8 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
         return querys[a].back() < querys[b].back();
     });
 
-    char* d_querys_data = nullptr;
-    std::thread* pack_thread;
-    pack_thread = new std::thread(PackQuerys<uint32_t>, std::ref(querys), std::ref(query_idx), batch_size, total_query_len_bytes, batch_query_bytes,
-                                  n_batches, &d_querys_data);
-
     uint16_t* d_docs = nullptr;
     int* d_doc_lens = nullptr;
-
-    // copy to device
     CHECK(cudaMalloc(&d_docs, sizeof(uint16_t) * MAX_DOC_SIZE * n_docs));
     CHECK(cudaMalloc(&d_doc_lens, sizeof(int) * n_docs));
 
@@ -176,9 +239,6 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
 
     cudaSetDevice(0);
 
-    pack_thread->join();
-    delete pack_thread;
-
     for (int i = 0; i < n_docs; ++i) {
         s_indices[i] = i;
     }
@@ -192,62 +252,82 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
         lens_offset[i + 1] = lens_offset[i] + lens_freq[i];
     }
 
-    std::vector<short> batch_scores(n_docs * batch_size);
+    std::vector<short> batch_scores(n_docs * init_batch_size);
     short* d_batch_scores = nullptr;
-    CHECK(cudaMalloc(&d_batch_scores, sizeof(short) * n_docs * batch_size));
+    char* d_querys_data = nullptr;
+    CHECK(cudaMalloc(&d_batch_scores, sizeof(short) * n_docs * init_batch_size));
+    CHECK(cudaMalloc(&d_querys_data, max_batch_query_bytes));
+    char* h_querys_data = new char[max_batch_query_bytes];
     indices.resize(n_querys);
-    for (size_t idx = 0; idx < n_querys; idx += batch_size) {
+    uint16_t* d_query_len = reinterpret_cast<uint16_t*>(d_querys_data);
+    uint32_t* d_query_mask = reinterpret_cast<uint32_t*>(d_querys_data + MAX_BATCH_SIZE * sizeof(uint16_t));
+    uint16_t* h_query_len = reinterpret_cast<uint16_t*>(h_querys_data);
+    for (size_t idx = 0; idx < n_querys; idx += init_batch_size) {
         auto t1 = start_time();
-        uint16_t* d_query_len = reinterpret_cast<uint16_t*>(d_querys_data) + idx;
-        uint32_t* d_query_batch = reinterpret_cast<uint32_t*>(d_querys_data + total_query_len_bytes + idx / batch_size * batch_query_bytes);
+        batch_size = init_batch_size;
         if (idx + batch_size > n_querys) {
             batch_size = n_querys - idx;
         }
+        // 1. 去除空query
+        std::vector<int> cur_query_idx;
+        for (int j = 0; j < batch_size; ++j) {
+            int q_index = query_idx[idx + j];
+            if (querys[q_index].empty()) {
+                std::vector<int> s_ans(TOPK);
+                std::iota(s_ans.begin(), s_ans.end(), 0);
+                indices[q_index] = std::move(s_ans);
+                continue;
+            }
+            cur_query_idx.push_back(q_index);
+        }
+        batch_size = cur_query_idx.size();
+        if (batch_size == 0) {
+            continue;
+        }
 
+        // 2. 打包query
+        PackQuerys(querys, cur_query_idx, batch_size, h_querys_data, d_querys_data);
+
+        // 3. 查找范围
         int max_query_len = 0;
         int min_query_len = MAX_DOC_SIZE;
         uint16_t max_query_token = 0;
         for (int q = 0; q < batch_size; ++q) {
-            auto& query = querys[query_idx[idx + q]];
+            auto& query = querys[cur_query_idx[q]];
             min_query_len = std::min(min_query_len, static_cast<int>(query.size()));
             max_query_len = std::max(max_query_len, static_cast<int>(query.size()));
             max_query_token = std::max(max_query_token, query.back());
         }
-        const int window = 10;
-        int doc_len_start = std::max(0, min_query_len - window);
-        int doc_len_end = std::min(MAX_DOC_SIZE, max_query_len + 2 * window) + 1;
-        int doc_num = lens_offset[doc_len_end] - lens_offset[doc_len_start];
-        while (doc_num < TOPK) {
+        int doc_len_start = std::max(0, min_query_len - WINDOW_SIZE);
+        int doc_len_end = std::min(MAX_DOC_SIZE, max_query_len + 2 * WINDOW_SIZE) + 1;
+        int win_docs = lens_offset[doc_len_end] - lens_offset[doc_len_start];
+        while (win_docs < TOPK) {
             doc_len_start = std::max(0, doc_len_start - 1);
             doc_len_end = std::min(129, doc_len_end + 1);
-            doc_num = lens_offset[doc_len_end] - lens_offset[doc_len_start];
+            win_docs = lens_offset[doc_len_end] - lens_offset[doc_len_start];
         }
         size_t doc_start = lens_offset[doc_len_start];
         size_t doc_end = lens_offset[doc_len_end];
-        std::cout << "Docs len from " << doc_len_start << " to " << doc_len_end << std::endl;
-        std::cout << "Docs offset from " << doc_start << " to " << doc_end << " || " << doc_num << std::endl;
+        // std::cout << "Docs len from " << doc_len_start << " to " << doc_len_end << std::endl;
+        // std::cout << "Docs offset from " << doc_start << " to " << doc_end << " || " << win_docs << std::endl;
 
+        // 4. 查询窗口
         int block = N_THREADS_IN_ONE_BLOCK;
-        int grid = (n_docs + block - 1) / block;
+        int grid = (win_docs + block - 1) / block;
         if (batch_size == 1) {
-            docQueryScoringInWindowKernel<uint32_t, 1>
-                <<<grid, block>>>(d_docs, d_doc_lens, n_docs, doc_start, doc_end, d_query_len, d_query_batch, d_batch_scores);
+            docQueryScoringInWindowKernel<uint32_t, 1><<<grid, block>>>(d_docs, d_doc_lens, win_docs, n_docs, doc_start, doc_end, d_query_len,
+                                                                        d_query_mask, max_query_token, d_batch_scores);
         } else if (batch_size == 2) {
-            docQueryScoringInWindowKernel<uint2, 2>
-                <<<grid, block>>>(d_docs, d_doc_lens, n_docs, doc_start, doc_end, d_query_len, d_query_batch, d_batch_scores);
+            docQueryScoringInWindowKernel<uint2, 2><<<grid, block>>>(d_docs, d_doc_lens, win_docs, n_docs, doc_start, doc_end, d_query_len,
+                                                                     d_query_mask, max_query_token, d_batch_scores);
         } else if (batch_size == 3) {
-            docQueryScoringInWindowKernel<uint3, 3>
-                <<<grid, block>>>(d_docs, d_doc_lens, n_docs, doc_start, doc_end, d_query_len, d_query_batch, d_batch_scores);
+            docQueryScoringInWindowKernel<uint3, 3><<<grid, block>>>(d_docs, d_doc_lens, win_docs, n_docs, doc_start, doc_end, d_query_len,
+                                                                     d_query_mask, max_query_token, d_batch_scores);
         } else {
-            docQueryScoringInWindowKernel<uint4, 4>
-                <<<grid, block>>>(d_docs, d_doc_lens, n_docs, doc_start, doc_end, d_query_len, d_query_batch, d_batch_scores);
+            docQueryScoringInWindowKernel<uint4, 4><<<grid, block>>>(d_docs, d_doc_lens, win_docs, n_docs, doc_start, doc_end, d_query_len,
+                                                                     d_query_mask, max_query_token, d_batch_scores);
         }
         cudaDeviceSynchronize();
-
-        end_time(t1, "QueryScoring kernel cost: ");
-        t1 = start_time();
-
-        CHECK(cudaMemcpy(batch_scores.data(), d_batch_scores, sizeof(short) * n_docs * batch_size, cudaMemcpyDeviceToHost));
 
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
@@ -256,23 +336,184 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
             exit(1);
         }
 
-        end_time(t1, "Copy scores cost: ");
+        end_time(t1, "QueryScoringInWindow kernel cost: ", idx / init_batch_size);
+        t1 = start_time();
+
+        CHECK(cudaMemcpy(batch_scores.data(), d_batch_scores, sizeof(short) * win_docs * batch_size, cudaMemcpyDeviceToHost));
+
+        end_time(t1, "CopyWindow scores cost: ", idx / init_batch_size);
 
         t1 = start_time();
+        std::vector<int> unfinished_querys;
+        float cur_score_thresh = 1.0f;
+        std::vector<std::vector<int>> win_topk_indices(MAX_BATCH_SIZE);
+        std::vector<std::vector<short>> win_topk_scores(MAX_BATCH_SIZE);
+        int cur_min_start = MAX_DOC_SIZE;
+        int cur_max_end = 0;
+        int cur_doc_len_start;
+        int cur_doc_len_end;
         for (int q = 0; q < batch_size; q++) {
-            short* scores = batch_scores.data() + q * n_docs;
+            short* scores = batch_scores.data() + q * win_docs;
+            std::vector<int> window_indices(s_indices.begin(), s_indices.begin() + win_docs);
+            std::vector<short> window_scores(TOPK);
+            std::vector<short> window_len(TOPK);
 
-            std::vector<int> temp_indices(s_indices);
-            std::partial_sort(temp_indices.begin(), temp_indices.begin() + TOPK, temp_indices.end(), [&scores](const int& a, const int& b) {
+            std::partial_sort(window_indices.begin(), window_indices.begin() + TOPK, window_indices.end(), [&scores](const int& a, const int& b) {
                 if (scores[a] != scores[b]) {
                     return scores[a] > scores[b];
                 }
                 return a < b;
             });
-            std::vector<int> s_ans(temp_indices.begin(), temp_indices.begin() + TOPK);
-            indices[query_idx[idx + q]].swap(s_ans);
+
+            float score_thresh = scores[window_indices.back()] / 16384.0f;
+
+            bool finished = score_thresh > 0.f && static_cast<int>(h_query_len[q] * score_thresh) >= doc_len_start &&
+                            std::min(128, static_cast<int>(h_query_len[q] / score_thresh)) < doc_len_end;
+            finished = finished || (doc_len_start == 0 && doc_len_end == 129);
+            std::vector<int> window_topk(window_indices.begin(), window_indices.begin() + TOPK);
+            for (int k = 0; k < TOPK; k++) {
+                window_scores[k] = scores[window_topk[k]];
+            }
+            for (int k = 0; k < TOPK; k++) {
+                window_topk[k] += doc_start;
+                window_len[k] = lens[window_topk[k]];
+            }
+
+            if (finished) {
+                indices[cur_query_idx[q]].swap(window_topk);
+            } else {
+                win_topk_indices[unfinished_querys.size()] = window_topk;
+                win_topk_scores[unfinished_querys.size()] = window_scores;
+
+                unfinished_querys.push_back(cur_query_idx[q]);
+                cur_score_thresh = std::min(cur_score_thresh, score_thresh);
+                if (score_thresh == 0.f) {
+                    cur_min_start = 0;
+                    cur_max_end = MAX_DOC_SIZE + 1;
+                } else {
+                    int min_start = static_cast<int>(h_query_len[q] * score_thresh);
+                    int max_end = std::min(MAX_DOC_SIZE + 1, static_cast<int>(h_query_len[q] / score_thresh + 1));
+                    cur_min_start = std::min(cur_min_start, min_start);
+                    cur_max_end = std::max(cur_max_end, max_end);
+                }
+            }
         }
-        end_time(t1, "Partial sort cost: ");
+        cur_query_idx = unfinished_querys;
+        if (cur_query_idx.empty()) {
+            continue;
+        }
+        end_time(t1, "Window sort cost: ", idx / init_batch_size);
+
+        t1 = start_time();
+
+        // 6. 剩余部分
+        if (batch_size != cur_query_idx.size()) {
+            batch_size = cur_query_idx.size();
+            PackQuerys(querys, cur_query_idx, batch_size, h_querys_data, d_querys_data);
+        }
+
+        cur_doc_len_start = doc_len_start;
+        cur_doc_len_end = doc_len_end;
+        doc_len_start = std::min(cur_min_start, doc_len_start);
+        doc_len_end = std::max(cur_max_end, doc_len_end);
+
+        // 搜索范围为 [doc_len_start, cur_doc_len_start) 及 [cur_doc_len_end, doc_len_end)
+        int doc_num1 = lens_offset[cur_doc_len_start] - lens_offset[doc_len_start];
+        int doc_offset1 = lens_offset[doc_len_start];
+        int doc_num2 = lens_offset[doc_len_end] - lens_offset[cur_doc_len_end];
+        int doc_offset2 = lens_offset[cur_doc_len_end];
+        int doc_num = doc_num1 + doc_num2;
+
+        assert(doc_num1 >= 0);
+        assert(doc_num2 >= 0);
+        assert(doc_num > 0);
+
+        // std::cout << "Docs len1 from " << doc_len_start << " to " << cur_doc_len_start << std::endl;
+        // std::cout << "Docs len2 from " << cur_doc_len_end << " to " << doc_len_end << std::endl;
+        // std::cout << "Docs offset1 from " << doc_offset1 << " to " << lens_offset[cur_doc_len_start] << " || " << doc_num1 << std::endl;
+        // std::cout << "Docs offset2 from " << doc_offset2 << " to " << lens_offset[doc_len_end] << " || " << doc_num2 << std::endl;
+        // std::cout << "doc_num = " << doc_num << std::endl;
+        // std::cout << "batch_size = " << batch_size << std::endl;
+
+        block = N_THREADS_IN_ONE_BLOCK;
+        grid = (doc_num + N_THREADS_IN_ONE_BLOCK - 1) / N_THREADS_IN_ONE_BLOCK;
+        if (batch_size == 1) {
+            docQueryScoringThreshKernel<uint32_t, 1><<<grid, block>>>(d_docs, d_doc_lens, doc_offset1, doc_num1, doc_offset2, doc_num2, n_docs,
+                                                                      d_query_len, d_query_mask, max_query_len, max_query_token, cur_score_thresh,
+                                                                      d_batch_scores);
+        } else if (batch_size == 2) {
+            docQueryScoringThreshKernel<uint2, 2><<<grid, block>>>(d_docs, d_doc_lens, doc_offset1, doc_num1, doc_offset2, doc_num2, n_docs,
+                                                                   d_query_len, d_query_mask, max_query_len, max_query_token, cur_score_thresh,
+                                                                   d_batch_scores);
+        } else if (batch_size == 3) {
+            docQueryScoringThreshKernel<uint3, 3><<<grid, block>>>(d_docs, d_doc_lens, doc_offset1, doc_num1, doc_offset2, doc_num2, n_docs,
+                                                                   d_query_len, d_query_mask, max_query_len, max_query_token, cur_score_thresh,
+                                                                   d_batch_scores);
+        } else {
+            docQueryScoringThreshKernel<uint4, 4><<<grid, block>>>(d_docs, d_doc_lens, doc_offset1, doc_num1, doc_offset2, doc_num2, n_docs,
+                                                                   d_query_len, d_query_mask, max_query_len, max_query_token, cur_score_thresh,
+                                                                   d_batch_scores);
+        }
+        cudaDeviceSynchronize();
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            printf("ERROR: %s:%d,", __FILE__, __LINE__);
+            printf("CUDA Error[%d]: %s\n", err, cudaGetErrorString(err));
+            exit(1);
+        }
+        end_time(t1, "QueryScoringThreshKernel kernel cost: ", idx / init_batch_size);
+
+        t1 = start_time();
+        CHECK(cudaMemcpy(batch_scores.data(), d_batch_scores, sizeof(short) * doc_num * batch_size, cudaMemcpyDeviceToHost));
+        end_time(t1, "CopyWindow scores cost: ", idx / init_batch_size);
+
+        // 7. 排序剩余部分并合并
+        t1 = start_time();
+        int new_topk = std::min(doc_num, TOPK);
+        for (int q = 0; q < batch_size; q++) {
+            short* scores = batch_scores.data() + q * doc_num;
+            std::vector<int> other_indices(s_indices.begin(), s_indices.begin() + doc_num);
+            std::vector<short> other_scores(new_topk);
+            std::partial_sort(other_indices.begin(), other_indices.begin() + new_topk, other_indices.end(), [&scores](const int& a, const int& b) {
+                if (scores[a] != scores[b]) {
+                    return scores[a] > scores[b];
+                }
+                return a < b;
+            });
+            std::vector<int> other_topk(other_indices.begin(), other_indices.begin() + new_topk);
+            for (int k = 0; k < new_topk; k++) {
+                other_scores[k] = scores[other_topk[k]];
+            }
+            for (int k = 0; k < TOPK; k++) {
+                int did = other_topk[k];
+                other_topk[k] = did < doc_num1 ? (doc_offset1 + did) : (doc_offset2 + did - doc_num1);
+            }
+            std::vector<int>& win_topk = win_topk_indices[q];
+            std::vector<short>& win_scores = win_topk_scores[q];
+            std::vector<int> s_ans(TOPK);
+            int win_idx = 0;
+            int other_idx = 0;
+
+            for (int k = 0; k < TOPK; ++k) {
+                if (win_scores[win_idx] > other_scores[other_idx] || other_idx >= new_topk) {
+                    s_ans[k] = win_topk[win_idx];
+                    win_idx++;
+                } else if (win_scores[win_idx] < other_scores[other_idx]) {
+                    s_ans[k] = other_topk[other_idx];
+                    other_idx++;
+                } else {
+                    if (win_topk[win_idx] < other_topk[other_idx]) {
+                        s_ans[k] = win_topk[win_idx];
+                        win_idx++;
+                    } else {
+                        s_ans[k] = other_topk[other_idx];
+                        other_idx++;
+                    }
+                }
+            }
+            indices[cur_query_idx[q]].swap(s_ans);
+        }
+        end_time(t1, "Merge result cost: ", idx / init_batch_size);
     }
 
     // deallocation
@@ -281,4 +522,5 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
     cudaFree(d_querys_data);
     cudaFree(d_batch_scores);
     free(h_docs);
+    free(h_querys_data);
 }
