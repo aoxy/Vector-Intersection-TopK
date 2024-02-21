@@ -186,6 +186,27 @@ void end_time(std::chrono::time_point<std::chrono::high_resolution_clock>& t1, s
               << std::endl;
 }
 
+void do_pack_docs(const std::vector<std::vector<uint16_t>>& docs,
+                  uint16_t* h_docs,
+                  std::vector<int>& h_doc_lens_vec,
+                  const size_t from,
+                  const size_t to) {
+    auto n_docs = docs.size();
+    for (int i = from; i < to; i++) {
+        for (int j = 0; j < docs[i].size(); j++) {
+            auto group_sz = sizeof(group_t) / sizeof(uint16_t);
+            auto layer_0_offset = j / group_sz;
+            auto layer_0_stride = n_docs * group_sz;
+            auto layer_1_offset = i;
+            auto layer_1_stride = group_sz;
+            auto layer_2_offset = j % group_sz;
+            auto final_offset = layer_0_offset * layer_0_stride + layer_1_offset * layer_1_stride + layer_2_offset;
+            h_docs[final_offset] = docs[i][j];
+        }
+        h_doc_lens_vec[i] = docs[i].size();
+    }
+}
+
 void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
                                     std::vector<std::vector<uint16_t>>& docs,
                                     std::vector<uint16_t>& lens,
@@ -214,25 +235,41 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
     CHECK(cudaMalloc(&d_docs, sizeof(uint16_t) * MAX_DOC_SIZE * n_docs));
     CHECK(cudaMalloc(&d_doc_lens, sizeof(int) * n_docs));
 
+    auto t0 = start_time();
+    size_t n_threads = 16;
+    if (n_threads > n_docs) {
+        n_threads = n_docs;
+    }
+    size_t n_docs_per_thread = n_docs / n_threads;
+    size_t n_onemore_doc_thread = n_docs - n_docs_per_thread * n_threads;
+    std::vector<size_t> docs_from(n_threads);
+    std::vector<size_t> docs_to(n_threads);
+    for (size_t i = 0; i < n_threads; i++) {
+        if (i < n_onemore_doc_thread) {
+            docs_from[i] = i * (n_docs_per_thread + 1);
+            docs_to[i] = (i + 1) * (n_docs_per_thread + 1);
+        } else {
+            docs_from[i] = i * (n_docs_per_thread) + n_onemore_doc_thread;
+            docs_to[i] = (i + 1) * (n_docs_per_thread) + n_onemore_doc_thread;
+        }
+    }
+    std::vector<std::thread> pack_docs_threads(n_threads - 1);
     uint16_t* h_docs = new uint16_t[MAX_DOC_SIZE * n_docs];
     memset(h_docs, 0, sizeof(uint16_t) * MAX_DOC_SIZE * n_docs);
     std::vector<int> h_doc_lens_vec(n_docs);
-    for (int i = 0; i < docs.size(); i++) {
-        for (int j = 0; j < docs[i].size(); j++) {
-            auto group_sz = sizeof(group_t) / sizeof(uint16_t);
-            auto layer_0_offset = j / group_sz;
-            auto layer_0_stride = n_docs * group_sz;
-            auto layer_1_offset = i;
-            auto layer_1_stride = group_sz;
-            auto layer_2_offset = j % group_sz;
-            auto final_offset = layer_0_offset * layer_0_stride + layer_1_offset * layer_1_stride + layer_2_offset;
-            h_docs[final_offset] = docs[i][j];
-        }
-        h_doc_lens_vec[i] = docs[i].size();
+    for (size_t i = 0; i < n_threads - 1; i++) {
+        pack_docs_threads[i] = std::thread([&, i]() { do_pack_docs(docs, h_docs, h_doc_lens_vec, docs_from[i], docs_to[i]); });
     }
+    do_pack_docs(docs, h_docs, h_doc_lens_vec, docs_from[n_threads - 1], docs_to[n_threads - 1]);
+    for (auto& t : pack_docs_threads) {
+        t.join();
+    }
+    end_time(t0, "Pack docs cost: ");
 
+    t0 = start_time();
     CHECK(cudaMemcpy(d_docs, h_docs, sizeof(uint16_t) * MAX_DOC_SIZE * n_docs, cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(d_doc_lens, h_doc_lens_vec.data(), sizeof(int) * n_docs, cudaMemcpyHostToDevice));
+    end_time(t0, "Copy docs cost: ");
 
     cudaDeviceProp device_props;
     cudaGetDeviceProperties(&device_props, 0);
@@ -465,7 +502,7 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
 
         t1 = start_time();
         CHECK(cudaMemcpy(batch_scores.data(), d_batch_scores, sizeof(short) * doc_num * batch_size, cudaMemcpyDeviceToHost));
-        end_time(t1, "CopyWindow scores cost: ", idx / init_batch_size);
+        end_time(t1, "CopyThresh scores cost: ", idx / init_batch_size);
 
         // 7. 排序剩余部分并合并
         t1 = start_time();
