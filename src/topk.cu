@@ -3,6 +3,7 @@
 #include <numeric>
 #include <string>
 #include <thread>
+#include "fast_topk.cuh"
 #include "topk.h"
 
 typedef uint4 group_t;  // uint32_t
@@ -272,9 +273,12 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
     end_time(t0, "Copy docs cost: ");
 
     cudaDeviceProp device_props;
+    cudaStream_t stream;
     cudaGetDeviceProperties(&device_props, 0);
 
     cudaSetDevice(0);
+
+    CHECK_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 
     for (int i = 0; i < n_docs; ++i) {
         s_indices[i] = i;
@@ -295,6 +299,13 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
     CHECK(cudaMalloc(&d_batch_scores, sizeof(short) * n_docs * init_batch_size));
     CHECK(cudaMalloc(&d_querys_data, max_batch_query_bytes));
     char* h_querys_data = new char[max_batch_query_bytes];
+    int topk_bytes = AlignSize(sizeof(Pair) * MAX_BATCH_SIZE * TOPK);
+    char* h_topk_pool = new char[topk_bytes];
+    Pair* h_topk = reinterpret_cast<Pair*>(h_topk_pool);
+    Pair* d_topk;
+    CHECK(cudaMalloc(&d_topk, topk_bytes));
+    int8_t* workspace;  // 64 * 1024 * 1024
+    CHECK(cudaMalloc(&workspace, AlignSize(64 * 1024 * 1024)));
     indices.resize(n_querys);
     uint16_t* d_query_len = reinterpret_cast<uint16_t*>(d_querys_data);
     uint32_t* d_query_mask = reinterpret_cast<uint32_t*>(d_querys_data + MAX_BATCH_SIZE * sizeof(uint16_t));
@@ -372,13 +383,13 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
             printf("CUDA Error[%d]: %s\n", err, cudaGetErrorString(err));
             exit(1);
         }
-
         end_time(t1, "QueryScoringInWindow kernel cost: ", idx / init_batch_size);
+
         t1 = start_time();
-
-        CHECK(cudaMemcpy(batch_scores.data(), d_batch_scores, sizeof(short) * win_docs * batch_size, cudaMemcpyDeviceToHost));
-
-        end_time(t1, "CopyWindow scores cost: ", idx / init_batch_size);
+        launch_gather_topk_kernel(d_batch_scores, d_topk, workspace, TOPK, batch_size, win_docs, stream);
+        CHECK(cudaMemcpyAsync(h_topk, d_topk, TOPK * batch_size * sizeof(Pair), cudaMemcpyDeviceToHost, stream));
+        CHECK(cudaStreamSynchronize(stream));
+        end_time(t1, "CopyWindowTopK cost: ", idx / init_batch_size);
 
         t1 = start_time();
         std::vector<int> unfinished_querys;
@@ -389,35 +400,30 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
         int cur_max_end = 0;
         int cur_doc_len_start;
         int cur_doc_len_end;
+        std::vector<short> window_scores(TOPK);
+        std::vector<int> window_topk(TOPK);
         for (int q = 0; q < batch_size; q++) {
-            short* scores = batch_scores.data() + q * win_docs;
-            std::vector<int> window_indices(s_indices.begin(), s_indices.begin() + win_docs);
-            std::vector<short> window_scores(TOPK);
-            std::vector<short> window_len(TOPK);
-
-            std::partial_sort(window_indices.begin(), window_indices.begin() + TOPK, window_indices.end(), [&scores](const int& a, const int& b) {
-                if (scores[a] != scores[b]) {
-                    return scores[a] > scores[b];
+            Pair* topk = h_topk + q * TOPK;
+            std::sort(topk, topk + TOPK, [](const Pair& a, const Pair& b) {
+                if (a.score != b.score) {
+                    return a.score > b.score;
                 }
-                return a < b;
+                return a.index < b.index;
             });
 
-            float score_thresh = scores[window_indices.back()] / 16384.0f;
+            for (int k = 0; k < TOPK; k++) {
+                window_scores[k] = topk[k].score;
+                window_topk[k] = topk[k].index + doc_start;
+            }
+
+            float score_thresh = window_scores.back() / 16384.0f;
 
             bool finished = score_thresh > 0.f && static_cast<int>(h_query_len[q] * score_thresh) >= doc_len_start &&
                             std::min(128, static_cast<int>(h_query_len[q] / score_thresh)) < doc_len_end;
             finished = finished || (doc_len_start == 0 && doc_len_end == 129);
-            std::vector<int> window_topk(window_indices.begin(), window_indices.begin() + TOPK);
-            for (int k = 0; k < TOPK; k++) {
-                window_scores[k] = scores[window_topk[k]];
-            }
-            for (int k = 0; k < TOPK; k++) {
-                window_topk[k] += doc_start;
-                window_len[k] = lens[window_topk[k]];
-            }
 
             if (finished) {
-                indices[cur_query_idx[q]].swap(window_topk);
+                indices[cur_query_idx[q]] = window_topk;
             } else {
                 win_topk_indices[unfinished_querys.size()] = window_topk;
                 win_topk_scores[unfinished_querys.size()] = window_scores;
@@ -460,6 +466,7 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
         int doc_num2 = lens_offset[doc_len_end] - lens_offset[cur_doc_len_end];
         int doc_offset2 = lens_offset[cur_doc_len_end];
         int doc_num = doc_num1 + doc_num2;
+        int new_topk = std::min(doc_num, TOPK);
 
         assert(doc_num1 >= 0);
         assert(doc_num2 >= 0);
@@ -501,32 +508,34 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
         end_time(t1, "QueryScoringThreshKernel kernel cost: ", idx / init_batch_size);
 
         t1 = start_time();
-        CHECK(cudaMemcpy(batch_scores.data(), d_batch_scores, sizeof(short) * doc_num * batch_size, cudaMemcpyDeviceToHost));
-        end_time(t1, "CopyThresh scores cost: ", idx / init_batch_size);
+        launch_gather_topk_kernel(d_batch_scores, d_topk, workspace, new_topk, batch_size, doc_num, stream);
+        CHECK(cudaMemcpyAsync(h_topk, d_topk, new_topk * batch_size * sizeof(Pair), cudaMemcpyDeviceToHost, stream));
+        CHECK(cudaStreamSynchronize(stream));
+        end_time(t1, "CopyThreshTopk scores cost: ", idx / init_batch_size);
 
         // 7. 排序剩余部分并合并
         t1 = start_time();
-        int new_topk = std::min(doc_num, TOPK);
+
+        std::vector<short> other_scores(new_topk);
+        std::vector<int> other_topk(new_topk);
+
         for (int q = 0; q < batch_size; q++) {
-            short* scores = batch_scores.data() + q * doc_num;
-            std::vector<int> other_indices(s_indices.begin(), s_indices.begin() + doc_num);
-            std::vector<short> other_scores(new_topk);
-            std::partial_sort(other_indices.begin(), other_indices.begin() + new_topk, other_indices.end(), [&scores](const int& a, const int& b) {
-                if (scores[a] != scores[b]) {
-                    return scores[a] > scores[b];
+            Pair* topk = h_topk + q * TOPK;
+            std::sort(topk, topk + TOPK, [](const Pair& a, const Pair& b) {
+                if (a.score != b.score) {
+                    return a.score > b.score;
                 }
-                return a < b;
+                return a.index < b.index;
             });
-            std::vector<int> other_topk(other_indices.begin(), other_indices.begin() + new_topk);
-            for (int k = 0; k < new_topk; k++) {
-                other_scores[k] = scores[other_topk[k]];
-            }
+
             for (int k = 0; k < TOPK; k++) {
-                int did = other_topk[k];
+                other_scores[k] = topk[k].score;
+                int did = topk[k].index;
                 other_topk[k] = did < doc_num1 ? (doc_offset1 + did) : (doc_offset2 + did - doc_num1);
             }
-            std::vector<int>& win_topk = win_topk_indices[q];
+
             std::vector<short>& win_scores = win_topk_scores[q];
+            std::vector<int>& win_topk = win_topk_indices[q];
             std::vector<int> s_ans(TOPK);
             int win_idx = 0;
             int other_idx = 0;
