@@ -567,6 +567,9 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
     cudaFree(d_doc_lens);
     cudaFree(d_querys_data);
     cudaFree(d_batch_scores);
+    cudaFree(d_topk);
+    cudaFree(workspace);
     free(h_docs);
     free(h_querys_data);
+    free(h_topk_pool);
 }
