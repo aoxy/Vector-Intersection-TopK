@@ -13,6 +13,7 @@
 #define QUERY_MASK_SIZE 1568
 #define MAX_BATCH_SIZE 4
 #define WINDOW_SIZE 10
+#define DOC_IN_GROUP (sizeof(group_t) / sizeof(uint16_t))
 
 #define CHECK(call)                                                          \
     {                                                                        \
