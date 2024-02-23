@@ -351,10 +351,8 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
             max_query_len = std::max(max_query_len, static_cast<int>(query.size()));
             max_query_token = std::max(max_query_token, query.back());
         }
-        // int doc_len_start = std::max(0, min_query_len - WINDOW_SIZE);
-        // int doc_len_end = std::min(MAX_DOC_SIZE, max_query_len + 2 * WINDOW_SIZE) + 1;
-        int doc_len_start = 0;
-        int doc_len_end = MAX_DOC_SIZE + 1;
+        int doc_len_start = std::max(0, min_query_len - WINDOW_SIZE);
+        int doc_len_end = std::min(MAX_DOC_SIZE, max_query_len + 2 * WINDOW_SIZE) + 1;
         int win_docs = lens_offset[doc_len_end] - lens_offset[doc_len_start];
         while (win_docs < TOPK) {
             doc_len_start = std::max(0, doc_len_start - 1);
