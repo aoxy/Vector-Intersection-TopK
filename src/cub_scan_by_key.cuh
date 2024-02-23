@@ -52,6 +52,7 @@ Nominal4BItemsToItemsCombined(int nominal_4b_items_per_thread, int combined_byte
                                combined_bytes));
 }
 
+#if CUB_VERSION < 101201
 template <typename NumeratorT, typename DenominatorT>
 __host__ __device__ __forceinline__ constexpr NumeratorT
 DivideAndRoundUp(NumeratorT n, DenominatorT d)
@@ -63,6 +64,7 @@ DivideAndRoundUp(NumeratorT n, DenominatorT d)
   // Static cast to undo integral promotion.
   return static_cast<NumeratorT>(n / d + (n % d != 0 ? 1 : 0));
 }
+#endif
 
 template <int                      _BLOCK_THREADS,
           int                      _ITEMS_PER_THREAD = 1,
