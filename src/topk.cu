@@ -207,12 +207,14 @@ void do_pack_docs(const std::vector<std::vector<uint16_t>>& docs,
         h_doc_lens_vec[i] = docs[i].size();
     }
 }
+// 3683 ms
 
 void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
                                     std::vector<std::vector<uint16_t>>& docs,
                                     std::vector<uint16_t>& lens,
                                     std::vector<std::vector<int>>& indices  // shape [querys.size(), TOPK]
 ) {
+    auto t0 = start_time();
     auto n_querys = querys.size();
     auto n_docs = docs.size();
     std::vector<int> s_indices(n_docs);
@@ -231,12 +233,42 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
         return querys[a].back() < querys[b].back();
     });
 
+    std::iota(s_indices.begin(), s_indices.end(), 0);
+    size_t lens_freq[129] = {0ul};
+    size_t lens_offset[130] = {0ul};
+    for (int i = 0; i < lens.size(); ++i) {
+        ++lens_freq[lens[i]];
+    }
+    for (int i = 0; i < 129; ++i) {
+        lens_offset[i + 1] = lens_offset[i] + lens_freq[i];
+    }
+    end_time(t0, "Init cost: ");
+
+    t0 = start_time();
     uint16_t* d_docs = nullptr;
     int* d_doc_lens = nullptr;
     CHECK(cudaMalloc(&d_docs, sizeof(uint16_t) * MAX_DOC_SIZE * n_docs));
     CHECK(cudaMalloc(&d_doc_lens, sizeof(int) * n_docs));
+    std::vector<short> batch_scores(n_docs * init_batch_size);
+    short* d_batch_scores = nullptr;
+    char* d_querys_data = nullptr;
+    CHECK(cudaMalloc(&d_batch_scores, sizeof(short) * n_docs * init_batch_size));
+    CHECK(cudaMalloc(&d_querys_data, max_batch_query_bytes));
+    char* h_querys_data = new char[max_batch_query_bytes];
+    int topk_bytes = AlignSize(sizeof(Pair) * MAX_BATCH_SIZE * TOPK);
+    char* h_topk_pool = new char[topk_bytes];
+    Pair* h_topk = reinterpret_cast<Pair*>(h_topk_pool);
+    Pair* d_topk;
+    CHECK(cudaMalloc(&d_topk, topk_bytes));
+    int8_t* workspace;  // 64 * 1024 * 1024
+    CHECK(cudaMalloc(&workspace, AlignSize(64 * 1024 * 1024)));
+    indices.resize(n_querys);
+    uint16_t* d_query_len = reinterpret_cast<uint16_t*>(d_querys_data);
+    uint32_t* d_query_mask = reinterpret_cast<uint32_t*>(d_querys_data + MAX_BATCH_SIZE * sizeof(uint16_t));
+    uint16_t* h_query_len = reinterpret_cast<uint16_t*>(h_querys_data);
+    end_time(t0, "Malloc cost: ");
 
-    auto t0 = start_time();
+    t0 = start_time();
     size_t n_threads = 16;
     if (n_threads > n_docs) {
         n_threads = n_docs;
@@ -280,36 +312,6 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
 
     CHECK_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 
-    for (int i = 0; i < n_docs; ++i) {
-        s_indices[i] = i;
-    }
-    assert(std::is_sorted(lens.begin(), lens.end()));
-    size_t lens_freq[129] = {0ul};
-    size_t lens_offset[130] = {0ul};
-    for (int i = 0; i < lens.size(); ++i) {
-        ++lens_freq[lens[i]];
-    }
-    for (int i = 0; i < 129; ++i) {
-        lens_offset[i + 1] = lens_offset[i] + lens_freq[i];
-    }
-
-    std::vector<short> batch_scores(n_docs * init_batch_size);
-    short* d_batch_scores = nullptr;
-    char* d_querys_data = nullptr;
-    CHECK(cudaMalloc(&d_batch_scores, sizeof(short) * n_docs * init_batch_size));
-    CHECK(cudaMalloc(&d_querys_data, max_batch_query_bytes));
-    char* h_querys_data = new char[max_batch_query_bytes];
-    int topk_bytes = AlignSize(sizeof(Pair) * MAX_BATCH_SIZE * TOPK);
-    char* h_topk_pool = new char[topk_bytes];
-    Pair* h_topk = reinterpret_cast<Pair*>(h_topk_pool);
-    Pair* d_topk;
-    CHECK(cudaMalloc(&d_topk, topk_bytes));
-    int8_t* workspace;  // 64 * 1024 * 1024
-    CHECK(cudaMalloc(&workspace, AlignSize(64 * 1024 * 1024)));
-    indices.resize(n_querys);
-    uint16_t* d_query_len = reinterpret_cast<uint16_t*>(d_querys_data);
-    uint32_t* d_query_mask = reinterpret_cast<uint32_t*>(d_querys_data + MAX_BATCH_SIZE * sizeof(uint16_t));
-    uint16_t* h_query_len = reinterpret_cast<uint16_t*>(h_querys_data);
     for (size_t idx = 0; idx < n_querys; idx += init_batch_size) {
         auto t1 = start_time();
         batch_size = init_batch_size;
