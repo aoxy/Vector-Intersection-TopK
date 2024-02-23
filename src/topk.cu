@@ -120,7 +120,7 @@ void __global__ docQueryScoringThreshKernel(const __restrict__ uint16_t* docs,
         register const group_t loaded = ((group_t*)(docs_ptr + i))[0];
         register uint16_t* doc_segment = (uint16_t*)(&loaded);
 #pragma unroll
-        for (auto j = 0; j < sizeof(group_t) / sizeof(uint16_t); j++) {
+        for (auto j = 0; j < DOC_IN_GROUP; j++) {
             const auto target_doc = doc_segment[j];
             if (target_doc == 0 || target_doc > max_query_token) {
                 no_more_load = true;
@@ -144,7 +144,7 @@ void __global__ docQueryScoringThreshKernel(const __restrict__ uint16_t* docs,
         for (auto q = 1; q < BatchSize; q++) {
             max_tmp_score = max(max_tmp_score, tmp_scores[q]);
         }
-        if (max_tmp_score + (doc_len - (i + 1) * 8) < tmp_score_thresh) {
+        if (max_tmp_score + (doc_len - (i + 1)) < tmp_score_thresh) {
             break;
         }
     }
@@ -571,6 +571,7 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>>& querys,
     t0 = start_time();
     cudaFree(d_docs);
     cudaFree(d_acc_doc_lens);
+    cudaFree(d_doc_lens);
     cudaFree(d_querys_data);
     cudaFree(d_batch_scores);
     cudaFree(d_topk);
